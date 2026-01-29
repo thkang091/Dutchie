@@ -1,0 +1,24 @@
+# Xcode
+DerivedData/
+.build/
+*.xcuserstate
+*.xccheckout
+*.xcscmblueprint
+*.moved-aside
+*.swp
+*.tmp
+
+# User-specific
+*.xcuserdatad/
+
+# SwiftPM
+.swiftpm/
+
+# CocoaPods (if you use it later)
+Pods/
+
+# Carthage (if used later)
+Carthage/Build/
+
+# Mac
+.DS_Store
