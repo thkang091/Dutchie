@@ -1,0 +1,22 @@
+# Xcode
+*.xcuserstate
+*.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+DerivedData/
+build/
+
+# Swift Package Manager
+.build/
+.swiftpm/
+
+# API Keys / Config
+Config.xcconfig
+Secrets.xcconfig
+*.xcconfig
+
+# CocoaPods
+Pods/
+Podfile.lock
+
+# macOS
+.DS_Store
