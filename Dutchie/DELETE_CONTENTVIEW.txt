@@ -1,0 +1,25 @@
+⚠️ CRITICAL STEP - READ THIS FIRST ⚠️
+
+YOU MUST DELETE THE DEFAULT ContentView.swift FILE!
+
+In Xcode's left sidebar, you should see:
+- DutchieApp.swift (keep this)
+- ContentView.swift (DELETE THIS ONE!)
+
+Right-click on ContentView.swift → Delete → Move to Trash
+
+If you don't delete it, you'll get "Invalid redeclaration of ContentView" error.
+
+---
+
+ALSO VERIFY: Make sure you created an iOS App project!
+
+Go to your project settings (click the blue Dutchie icon at the top):
+- Under TARGETS → General
+- Check "Supported Destinations" - it should say "iPhone" and "iPad"
+- If it says "Mac" or "My Mac", you created a macOS project by mistake
+  → You need to start over and create an iOS App project
+
+---
+
+After deleting ContentView.swift and confirming iOS target, build again.
