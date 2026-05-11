@@ -961,6 +961,19 @@ app.post("/parse-receipt", requireAppAuth, async (req, res) => {
   }
 });
 
+
+app.get("/", (req, res) => {
+  res.json({
+    ok: true,
+    message: "Dutchie backend is running 🚀",
+    endpoints: {
+      health: "/health",
+      parseReceipt: "/parse-receipt",
+    },
+    version: "2.0.1",
+  });
+});
+
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
