@@ -52,12 +52,33 @@ console.log("=".repeat(80) + "\n");
 const ConfidenceEnum = z.enum(["high", "medium", "low"]);
 const StatusEnum = z.enum(["success", "partial", "needs_review"]);
 const SourceEnum = z.enum(["model", "deterministic", "merged"]);
+const ItemCategoryEnum = z.enum([
+  "produce",
+  "meat_seafood",
+  "dairy_eggs",
+  "bakery",
+  "pantry",
+  "frozen",
+  "beverages",
+  "snacks",
+  "prepared_food",
+  "household",
+  "personal_care",
+  "health_wellness",
+  "pet",
+  "baby",
+  "alcohol",
+  "restaurant",
+  "general_merchandise",
+  "other",
+]);
 
 const ReceiptItemSchema = z.object({
   name: z.string().describe("Item name as shown on receipt"),
   amount: z.number().describe("FINAL charged amount after item-level discounts"),
   originalAmount: z.number().nullable().optional().describe("Amount before item-level discount"),
   itemDiscount: z.number().nullable().optional().describe("Discount amount applied to this specific item (positive number)"),
+  itemDiscountLabel: z.string().nullable().optional().describe("Visible label for the item-specific discount, such as coupon, member savings, or instant savings"),
   itemCode: z
     .string()
     .nullable()
@@ -94,6 +115,9 @@ const NormalizedItemNameSchema = z.object({
   needsVerification: z.boolean(),
   possibleAlternatives: z.array(z.string()),
   reason: z.string(),
+  category: ItemCategoryEnum,
+  categoryConfidence: z.number().min(0).max(1),
+  categoryReason: z.string(),
 });
 
 const ItemNameNormalizationResponseSchema = z.object({
@@ -124,7 +148,7 @@ ITEM EXTRACTION:
 Example - Item with discount:
   STEAK 25.00
   MEMBER DISCOUNT -5.00
-  → Extract ONE item: name="STEAK", amount=20.00, originalAmount=25.00, itemDiscount=5.00
+  → Extract ONE item: name="STEAK", amount=20.00, originalAmount=25.00, itemDiscount=5.00, itemDiscountLabel="MEMBER DISCOUNT"
 
 Example - Weighted item:
   APPLES 1.2 lb @ 2.99/lb 3.59
@@ -145,13 +169,24 @@ DISCOUNT TYPES:
 
 1. Item-Level Discount (reduce item amount):
    - Appears directly after specific item
-   - Keywords: "You saved", "Member savings", "Instant savings", "Coupon"
+   - Often appears on the next line, indented line, or paired line before the next purchased item
+   - Keywords: "You saved", "Member savings", "Instant savings", "Coupon", "Digital coupon", "Store coupon", "Sale", "Promo"
    - Action: Reduce the item's amount field and set itemDiscount
+   - Preserve the visible discount text in itemDiscountLabel when present
+   - itemDiscount must be a positive number, even if the receipt prints the discount as negative
 
 2. Order-Level Discount (orderLevelDiscount field):
    - Appears in totals section
    - Keywords: "TOTAL SAVINGS", "ORDER DISCOUNT", "PROMOTIONAL DISCOUNT"
    - Action: Put in orderLevelDiscount field, NOT in items
+
+DISCOUNT ACCURACY:
+- If an item has a printed price followed by a specific discount line, originalAmount is the printed price before discount.
+- The final item amount must equal originalAmount - itemDiscount.
+- Do not create a separate item for a discount line.
+- Do not drop an item-specific discount just because a total savings line also exists.
+- If the receipt only shows "YOU SAVED" or "TOTAL SAVINGS" without a clear item attachment, classify it as orderLevelDiscount or notes, not itemDiscount.
+- If uncertain whether a discount belongs to a specific item, keep the item amount visible on the purchased item and mention the uncertainty in notes.
 
 MULTI-LINE MERGING:
 OCR often splits items across lines - merge them carefully:
@@ -194,6 +229,8 @@ You do not have access to web search, product catalogs, retailer databases, or e
 
 Your goal is readability, not exact product identification.
 
+You also assign a simple split-friendly category so people can scan and divide the receipt faster.
+
 CORE PRINCIPLE
 
 When uncertain, preserve the original meaning instead of guessing.
@@ -219,6 +256,7 @@ You receive a JSON object:
 The merchant, item_code, and price are metadata.
 
 Do not use item_code, price, or merchant name to invent product details.
+Use raw_name as the primary evidence. You may use common receipt vocabulary, obvious OCR repair, and widely recognized retail brand/category signals only when the raw text strongly supports them.
 
 NORMALIZATION RULES
 
@@ -244,6 +282,10 @@ Safe abbreviation examples:
 - BROCC -> Broccoli
 - PTTO -> Potato
 - YLW -> Yellow
+- PROBIC -> Probiotic
+- PROBIO -> Probiotic
+- PROBIOT -> Probiotic
+- PROB -> Probiotic when attached to a supplement, vitamin, or probiotic brand token
 
 2. Preserve unclear tokens instead of guessing.
 
@@ -254,7 +296,53 @@ Examples:
 - ORG MEDITERR -> Organic Mediterr
 - SPCL -> Special
 
-3. Do not use memorized knowledge of a brand or product to add unsupported details.
+3. Remove receipt-only offer, promo, and pricing fragments from normalizedName when they are not part of the item identity.
+
+Examples:
+- RAO'S 2/31.7 -> Rao's
+- RAC'S 2/31.7 -> Rao's
+- RAOS 2 FOR 31.70 -> Rao's
+- CULTURELLE BO 2/$30 -> Culturelle Probiotic
+
+Do not include:
+- 2/31.7
+- 2 FOR
+- 2/$
+- BOGO
+- EA
+- regular price / sale price markers
+- taxability letters
+
+4. Use conservative brand and category recognition when directly supported by raw_name.
+
+This is allowed:
+- Correct obvious OCR misspellings of a brand when the raw token is very close to the brand.
+- Add a broad product category when the raw brand/token strongly and commonly identifies that category.
+- Expand a visible abbreviated category token such as PROBIC, PROBIO, PROBIOT, or PROB to Probiotic.
+
+This is not allowed:
+- Use external lookup, product catalogs, retailer APIs, or web search.
+- Use price to identify a product.
+- Use merchant alone to decide the item category.
+- Add flavor, count, size, animal type, package type, or product variant unless printed in raw_name.
+
+Brand/category examples:
+- CULTURELLE BO -> Culturelle Probiotic
+  Culturelle is a probiotic brand and BO is an unclear trailing token. Keep the label concise.
+
+- CULTRELLE PROB -> Culturelle Probiotic
+  Correct the obvious OCR brand typo and expand PROB.
+
+- NB PROBIC 70 -> NB Probiotic 70
+  Expand PROBIC, preserve NB because it is not enough evidence to expand the brand.
+
+- RAC'S 2/31.7 -> Rao's
+  Correct the obvious OCR confusion and remove the offer/pricing fragment.
+
+- RAOS -> Rao's
+  Add the apostrophe because the raw token clearly supports the brand.
+
+5. Do not use memorized knowledge of a brand or product to add unsupported details beyond conservative brand/category recognition.
 
 Examples:
 - AUSSIE BITES -> Aussie Bites
@@ -269,7 +357,7 @@ Examples:
 - TIRE EXT. -> Tire Ext.
   Do not expand it into "Tire Extension Kit", "Fire Extinguisher", or another specific product.
 
-4. Do not invent:
+6. Do not invent:
 - product type
 - animal type
 - flavor
@@ -283,7 +371,9 @@ Examples:
 
 unless directly supported by raw_name.
 
-5. Never use price to infer:
+Exception: a broad category may be used when raw_name contains a strong brand/category signal as described above, such as Culturelle -> Probiotic.
+
+7. Never use price to infer:
 - weight
 - quantity
 - package size
@@ -291,13 +381,13 @@ unless directly supported by raw_name.
 - product quality
 - product identity
 
-6. Never use merchant context alone to infer a product.
+8. Never use merchant context alone to infer a product.
 
 A Costco receipt does not mean every item is Kirkland Signature.
 A grocery receipt does not mean every unclear item is food.
 A brand-like phrase does not reveal the exact product type.
 
-7. Correct OCR only when the intended text is highly obvious.
+9. Correct OCR only when the intended text is highly obvious.
 
 Safe OCR corrections:
 - BANANASS -> Bananas
@@ -307,6 +397,13 @@ Safe OCR corrections:
 - CHOPONION -> Chopped Onion
 - CHIPTLE -> Chipotle
 - ONTO -> Onion only when strongly supported by context such as VIDALIA ONTO
+- CULTRELLE -> Culturelle
+- CULTUREL -> Culturelle
+- PROBIC -> Probiotic
+- PROBIO -> Probiotic
+- RAOS -> Rao's
+- RAO S -> Rao's
+- RAC'S -> Rao's only when the token is brand-like and paired with grocery/sauce-style receipt text or promo fragments
 
 Unsafe OCR corrections:
 - SKO 5X -> Skoal Bandits 5-Pack
@@ -315,17 +412,17 @@ Unsafe OCR corrections:
 - ORG MORNING -> Organic Morning Blend Coffee
 - ZIPLC SLIDER -> Ziploc Slider Bags
 
-8. If an abbreviation has multiple reasonable interpretations:
+10. If an abbreviation has multiple reasonable interpretations:
 - preserve the unclear token or use a generic expansion
 - set ambiguous to true
 - set needsVerification to true
 - lower confidence
 - include alternatives only when directly supported by the text
 
-9. Do not create alternatives merely to fill the array.
+11. Do not create alternatives merely to fill the array.
 Return an empty array when reliable alternatives are unavailable.
 
-10. Do not include unsupported speculation inside normalizedName.
+12. Do not include unsupported speculation inside normalizedName.
 
 Never include:
 - likely
@@ -335,7 +432,7 @@ Never include:
 - parenthetical guesses
 - explanatory notes
 
-11. Keep normalizedName concise.
+13. Keep normalizedName concise.
 Usually use 1 to 7 words.
 
 IMPORTANT EDGE CASES
@@ -362,6 +459,18 @@ IMPORTANT EDGE CASES
   Preserve the unclear abbreviation.
   Do not guess the full product name.
 
+- CULTURELLE BO -> Culturelle Probiotic
+  Use the widely recognized probiotic brand signal. Do not include BO unless it is clearly meaningful.
+
+- NB PROBIC 70 -> NB Probiotic 70
+  Expand PROBIC to Probiotic. Preserve NB and 70 because they are printed; do not invent the full brand name.
+
+- RAC'S 2/31.7 -> Rao's
+  Correct the obvious OCR brand confusion and remove the promo/pricing fragment.
+
+- RAOS 2 FOR 31.70 -> Rao's
+  Normalize the brand and remove the offer fragment.
+
 CONFIDENCE GUIDELINES
 
 1.00
@@ -377,11 +486,14 @@ CONFIDENCE GUIDELINES
 - Strong OCR cleanup or obvious abbreviation expansion with minor uncertainty
 - Example: CHERRY TOV -> Cherry Tomatoes on the Vine
 - Example: ORGSPRINGMIX -> Organic Spring Mix
+- Example: CULTURELLE BO -> Culturelle Probiotic
+- Example: RAC'S 2/31.7 -> Rao's
 
 0.60 to 0.84
 - Partially understandable, but one or more tokens remain unclear
 - Example: ORG 4BRY 5LB -> Organic 4-Berry, 5 lb
 - Example: TENDERLOIN -> Tenderloin
+- Example: NB PROBIC 70 -> NB Probiotic 70
 
 0.30 to 0.59
 - Highly ambiguous text
@@ -409,6 +521,46 @@ Set ambiguous to true whenever:
 
 Set ambiguous to false only when the cleaned meaning is clear.
 
+CATEGORY RULES
+
+Assign exactly one category to every item:
+- produce
+- meat_seafood
+- dairy_eggs
+- bakery
+- pantry
+- frozen
+- beverages
+- snacks
+- prepared_food
+- household
+- personal_care
+- health_wellness
+- pet
+- baby
+- alcohol
+- restaurant
+- general_merchandise
+- other
+
+Use the raw_name and normalizedName only.
+Do not use price to infer category.
+Do not use merchant alone to infer category.
+
+Category examples:
+- Organic Spring Mix -> produce
+- Cherry Tomatoes on the Vine -> produce
+- Pasture Eggs -> dairy_eggs
+- Pork Belly -> meat_seafood
+- Rao's -> pantry
+- Culturelle Probiotic -> health_wellness
+- NB Probiotic 70 -> health_wellness
+- Ziploc Slider -> household
+- Avocado Mash -> prepared_food if it appears ready-to-eat, otherwise produce
+
+If the category is unclear, use other.
+If the item is a broad non-food retail item, use general_merchandise.
+
 OUTPUT RULES
 
 Return valid JSON only.
@@ -432,7 +584,10 @@ Return exactly this structure:
       "ambiguous": true,
       "needsVerification": true,
       "possibleAlternatives": [],
-      "reason": "Short explanation based only on raw_name."
+      "reason": "Short explanation based only on raw_name.",
+      "category": "produce",
+      "categoryConfidence": 0.00,
+      "categoryReason": "Short category explanation based only on raw_name and normalizedName."
     }
   ]
 }`;
@@ -470,6 +625,58 @@ function normalizeItemName(name) {
   normalized = normalized.replace(/\s+/g, " ");
   
   return normalized.substring(0, 200);
+}
+
+function inferFallbackItemCategory(name) {
+  const lower = (name || "").toLowerCase();
+
+  if (/\b(lettuce|spring mix|tomato|tomatoes|banana|apple|avocado|berry|berries|kiwi|onion|potato|broccoli|produce|fruit|vegetable)\b/.test(lower)) {
+    return "produce";
+  }
+  if (/\b(chicken|beef|pork|belly|steak|tenderloin|fish|salmon|shrimp|seafood|meat)\b/.test(lower)) {
+    return "meat_seafood";
+  }
+  if (/\b(egg|eggs|milk|cheese|yogurt|butter|cream|dairy)\b/.test(lower)) {
+    return "dairy_eggs";
+  }
+  if (/\b(bread|bagel|muffin|cake|bakery|croissant|bun|roll)\b/.test(lower)) {
+    return "bakery";
+  }
+  if (/\b(rao|pasta|sauce|rice|flour|oil|spaghetti|pantry|cereal|beans)\b/.test(lower)) {
+    return "pantry";
+  }
+  if (/\b(frozen|ice cream)\b/.test(lower)) {
+    return "frozen";
+  }
+  if (/\b(water|juice|soda|coffee|tea|drink|beverage)\b/.test(lower)) {
+    return "beverages";
+  }
+  if (/\b(chip|chips|cookie|cookies|cracker|crackers|snack|candy|chocolate)\b/.test(lower)) {
+    return "snacks";
+  }
+  if (/\b(prepared|rotisserie|deli|meal|salad|soup|guac|guacamole|mash)\b/.test(lower)) {
+    return "prepared_food";
+  }
+  if (/\b(ziploc|trash|paper|towel|detergent|cleaner|soap|household)\b/.test(lower)) {
+    return "household";
+  }
+  if (/\b(shampoo|toothpaste|lotion|deodorant|personal care)\b/.test(lower)) {
+    return "personal_care";
+  }
+  if (/\b(probiotic|vitamin|medicine|supplement|culturelle|health|wellness)\b/.test(lower)) {
+    return "health_wellness";
+  }
+  if (/\b(dog|cat|pet)\b/.test(lower)) {
+    return "pet";
+  }
+  if (/\b(baby|diaper|formula)\b/.test(lower)) {
+    return "baby";
+  }
+  if (/\b(beer|wine|vodka|alcohol|liquor)\b/.test(lower)) {
+    return "alcohol";
+  }
+
+  return "other";
 }
 
 function isPaymentLine(text) {
@@ -574,18 +781,37 @@ function normalizeParsedReceipt(parsed) {
     merchant: normalizeMerchant(parsed.merchant),
     receiptDate: parsed.receiptDate || null,
     currency: parsed.currency || "USD",
-    items: (parsed.items || []).map(item => ({
-      name: normalizeItemName(item.name),
-      amount: round2(item.amount),
-      originalAmount: toNumber(item.originalAmount),
-      itemDiscount: toNumber(item.itemDiscount),
-      itemCode: item.itemCode ?? null,
-      qty: toNumber(item.qty),
-      unitPrice: toNumber(item.unitPrice),
-      weightLbs: toNumber(item.weightLbs),
-      confidence: item.confidence || "medium",
-      source: item.source || "model",
-    })),
+    items: (parsed.items || []).map(item => {
+      const originalAmount = toNumber(item.originalAmount);
+      const itemDiscount = toNumber(item.itemDiscount);
+      let amount = round2(item.amount);
+
+      if (
+        originalAmount != null &&
+        itemDiscount != null &&
+        itemDiscount > 0 &&
+        originalAmount >= itemDiscount
+      ) {
+        const discountedAmount = round2(originalAmount - itemDiscount);
+        if (amount == null || Math.abs(amount - discountedAmount) > 0.01) {
+          amount = discountedAmount;
+        }
+      }
+
+      return {
+        name: normalizeItemName(item.name),
+        amount,
+        originalAmount,
+        itemDiscount,
+        itemDiscountLabel: item.itemDiscountLabel ?? null,
+        itemCode: item.itemCode ?? null,
+        qty: toNumber(item.qty),
+        unitPrice: toNumber(item.unitPrice),
+        weightLbs: toNumber(item.weightLbs),
+        confidence: item.confidence || "medium",
+        source: item.source || "model",
+      };
+    }),
     subtotal: toNumber(parsed.subtotal),
     tax: toNumber(parsed.tax),
     tip: toNumber(parsed.tip),
@@ -991,6 +1217,9 @@ function fallbackNameNormalization(receipt) {
       needsNameVerification: true,
       possibleNameAlternatives: [],
       normalizationReason: "Normalization unavailable; preserved raw receipt text.",
+      category: inferFallbackItemCategory(item.name),
+      categoryConfidence: 0.35,
+      categoryReason: "Fallback category inferred from raw receipt text.",
     })),
   };
 }
@@ -1075,6 +1304,9 @@ async function normalizeItemNamesWithMistral(receipt, reqId) {
           needsNameVerification: aiResult.needsVerification,
           possibleNameAlternatives: aiResult.possibleAlternatives,
           normalizationReason: aiResult.reason,
+          category: aiResult.category,
+          categoryConfidence: aiResult.categoryConfidence,
+          categoryReason: aiResult.categoryReason,
         };
       }),
     };
@@ -1180,10 +1412,21 @@ function buildApiResponse(parseResult, timings, reqId) {
       normalizedName: item.normalizedName || item.name,
       itemCode: item.itemCode ?? null,
       amount: item.amount,
+      originalAmount: item.originalAmount ?? null,
+      itemDiscount: item.itemDiscount ?? null,
+      itemDiscountLabel: item.itemDiscountLabel ?? null,
+      hasItemDiscount: (item.itemDiscount ?? 0) > 0,
+      discountDisplayLabel:
+        (item.itemDiscount ?? 0) > 0
+          ? item.itemDiscountLabel || `Discount applied - $${item.itemDiscount.toFixed(2)}`
+          : null,
       qty: item.qty,
       unitPrice: item.unitPrice,
       weightLbs: item.weightLbs,
       confidence: item.confidence,
+      category: item.category || inferFallbackItemCategory(item.normalizedName || item.name),
+      categoryConfidence: item.categoryConfidence ?? 0,
+      categoryReason: item.categoryReason ?? "Category unavailable.",
       normalizationConfidence: item.normalizationConfidence ?? 0,
       normalizationAmbiguous: item.normalizationAmbiguous ?? true,
       needsNameVerification: item.needsNameVerification ?? true,
@@ -1230,7 +1473,23 @@ function buildApiResponse(parseResult, timings, reqId) {
           needsVerification: item.needsNameVerification ?? true,
           alternatives: item.possibleNameAlternatives ?? [],
           reason: item.normalizationReason ?? null,
+          category: item.category || inferFallbackItemCategory(item.normalizedName || item.name),
+          categoryConfidence: item.categoryConfidence ?? 0,
+          categoryReason: item.categoryReason ?? null,
         })),
+      },
+      item_discounts: {
+        enabled: true,
+        items: parsed.items
+          .filter(item => (item.itemDiscount ?? 0) > 0)
+          .map(item => ({
+            rawName: item.rawName || item.name,
+            normalizedName: item.normalizedName || item.name,
+            originalAmount: item.originalAmount ?? null,
+            finalAmount: item.amount,
+            itemDiscount: item.itemDiscount,
+            itemDiscountLabel: item.itemDiscountLabel ?? null,
+          })),
       },
       contradiction_resolution: {
         suspicious_items_detected: resolutionResult.suspicious.length,
