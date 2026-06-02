@@ -58,6 +58,11 @@ const ReceiptItemSchema = z.object({
   amount: z.number().describe("FINAL charged amount after item-level discounts"),
   originalAmount: z.number().nullable().optional().describe("Amount before item-level discount"),
   itemDiscount: z.number().nullable().optional().describe("Discount amount applied to this specific item (positive number)"),
+  itemCode: z
+    .string()
+    .nullable()
+    .optional()
+    .describe("Retailer item number or SKU printed directly next to the item, if visible"),
   qty: z.number().nullable().optional().describe("Quantity purchased"),
   unitPrice: z.number().nullable().optional().describe("Price per unit before discounts"),
   weightLbs: z.number().nullable().optional().describe("Weight in pounds for weighted items"),
@@ -78,6 +83,21 @@ const MistralReceiptSchema = z.object({
   grandTotal: z.number().nullable().optional().describe("Final total (BALANCE DUE, GRAND TOTAL, etc.)"),
   confidence: ConfidenceEnum.describe("Overall extraction confidence"),
   notes: z.string().nullable().optional().describe("Parsing notes or warnings"),
+});
+
+const NormalizedItemNameSchema = z.object({
+  index: z.number().int(),
+  original: z.string(),
+  normalizedName: z.string(),
+  confidence: z.number().min(0).max(1),
+  ambiguous: z.boolean(),
+  needsVerification: z.boolean(),
+  possibleAlternatives: z.array(z.string()),
+  reason: z.string(),
+});
+
+const ItemNameNormalizationResponseSchema = z.object({
+  items: z.array(NormalizedItemNameSchema),
 });
 
 // ============================================================
@@ -139,6 +159,13 @@ OCR often splits items across lines - merge them carefully:
 - Weighted produce across multiple lines → merge into single item with weight info
 - Item + discount line immediately after → merge into one item with reduced amount
 
+ITEM CODE:
+- If a retailer item number or SKU is visibly printed next to a purchased item, extract it as itemCode.
+- Preserve leading zeros.
+- Treat itemCode as a string.
+- If no item code is visible, use null.
+- Never invent an item code.
+
 TOTAL PRIORITY (choose strongest):
 1. BALANCE DUE
 2. GRAND TOTAL
@@ -158,6 +185,257 @@ Before returning, verify: sum(items) + tax + tip + fees - orderLevelDiscount ≈
 If this doesn't match, re-check your item amounts and discount classification.
 
 Return clean JSON. Do not invent fields. Prioritize correctness over completeness.`;
+
+const ITEM_NAME_NORMALIZATION_PROMPT = `You are a conservative receipt item normalization engine.
+
+Your task is to convert OCR-extracted receipt item text into a clean, concise, human-readable label using only information directly supported by the input text.
+
+You do not have access to web search, product catalogs, retailer databases, or external tools.
+
+Your goal is readability, not exact product identification.
+
+CORE PRINCIPLE
+
+When uncertain, preserve the original meaning instead of guessing.
+
+A shorter generic label is better than a specific but unsupported product name.
+
+INPUT FORMAT
+
+You receive a JSON object:
+
+{
+  "merchant": "string",
+  "items": [
+    {
+      "index": 0,
+      "raw_name": "string",
+      "item_code": "string or null",
+      "price": 0.00
+    }
+  ]
+}
+
+The merchant, item_code, and price are metadata.
+
+Do not use item_code, price, or merchant name to invent product details.
+
+NORMALIZATION RULES
+
+1. Expand only clear and widely recognized receipt abbreviations.
+
+Safe abbreviation examples:
+- KS -> Kirkland Signature
+- ORG -> Organic
+- CKN -> Chicken
+- GUAC -> Guacamole
+- SNGL -> Single-Serve
+- FR -> Free-Range
+- ABF -> Antibiotic-Free
+- ROT -> Rotisserie
+- LB -> lb
+- OZ -> oz
+- PK -> Pack
+- CT -> Count
+- ZIPLC -> Ziploc
+- TOV -> Tomatoes on the Vine
+- SLCD -> Sliced
+- EVOO -> Extra Virgin Olive Oil
+- BROCC -> Broccoli
+- PTTO -> Potato
+- YLW -> Yellow
+
+2. Preserve unclear tokens instead of guessing.
+
+Examples:
+- SKO 5X -> SKO 5X
+- TERRA DLYSSA -> Terra Dlyssa
+- ORG MORNING -> Organic Morning
+- ORG MEDITERR -> Organic Mediterr
+- SPCL -> Special
+
+3. Do not use memorized knowledge of a brand or product to add unsupported details.
+
+Examples:
+- AUSSIE BITES -> Aussie Bites
+  Do not add "Dog Treats", "Organic", or a package size unless stated.
+
+- TERRA DLYSSA -> Terra Dlyssa
+  Do not add "Olive Oil", "Yogurt", or "Drink" unless stated.
+
+- ZIPLC SLIDER -> Ziploc Slider
+  Do not add "Bags", "Sandwiches", "Frozen Appetizers", or food-related details unless stated.
+
+- TIRE EXT. -> Tire Ext.
+  Do not expand it into "Tire Extension Kit", "Fire Extinguisher", or another specific product.
+
+4. Do not invent:
+- product type
+- animal type
+- flavor
+- package count
+- unit size
+- weight
+- brand
+- dietary attribute
+- preparation method
+- category-specific details
+
+unless directly supported by raw_name.
+
+5. Never use price to infer:
+- weight
+- quantity
+- package size
+- product category
+- product quality
+- product identity
+
+6. Never use merchant context alone to infer a product.
+
+A Costco receipt does not mean every item is Kirkland Signature.
+A grocery receipt does not mean every unclear item is food.
+A brand-like phrase does not reveal the exact product type.
+
+7. Correct OCR only when the intended text is highly obvious.
+
+Safe OCR corrections:
+- BANANASS -> Bananas
+- TENDERION -> Tenderloin
+- ORGSPRINGMIX -> Organic Spring Mix
+- SPAGHTTI -> Spaghetti
+- CHOPONION -> Chopped Onion
+- CHIPTLE -> Chipotle
+- ONTO -> Onion only when strongly supported by context such as VIDALIA ONTO
+
+Unsafe OCR corrections:
+- SKO 5X -> Skoal Bandits 5-Pack
+- TERRA DLYSSA -> Terra Delyssa Olive Oil
+- TIRE EXT. -> Fire Extinguisher
+- ORG MORNING -> Organic Morning Blend Coffee
+- ZIPLC SLIDER -> Ziploc Slider Bags
+
+8. If an abbreviation has multiple reasonable interpretations:
+- preserve the unclear token or use a generic expansion
+- set ambiguous to true
+- set needsVerification to true
+- lower confidence
+- include alternatives only when directly supported by the text
+
+9. Do not create alternatives merely to fill the array.
+Return an empty array when reliable alternatives are unavailable.
+
+10. Do not include unsupported speculation inside normalizedName.
+
+Never include:
+- likely
+- probably
+- possibly
+- maybe
+- parenthetical guesses
+- explanatory notes
+
+11. Keep normalizedName concise.
+Usually use 1 to 7 words.
+
+IMPORTANT EDGE CASES
+
+- TENDERLOIN -> Tenderloin
+  Do not infer beef, pork, chicken, or lamb.
+  Mark ambiguous because the animal type is unclear.
+
+- ORG 4BRY 5LB -> Organic 4-Berry, 5 lb
+  Do not convert 4BRY into Blueberries.
+  Do not add "Blend" unless explicitly stated.
+
+- ABF CKN CUBE -> Antibiotic-Free Cubed Chicken
+  ABF means Antibiotic-Free.
+  Do not expand ABF into Airline Breast.
+
+- AUSSIE BITES -> Aussie Bites
+  Do not infer that it is a dog treat.
+
+- ZIPLC SLIDER -> Ziploc Slider
+  Do not infer whether it is a bag, sandwich, or food product.
+
+- TIRE EXT. -> Tire Ext.
+  Preserve the unclear abbreviation.
+  Do not guess the full product name.
+
+CONFIDENCE GUIDELINES
+
+1.00
+- Exact readable text with no abbreviation or ambiguity
+- Example: BANANAS -> Bananas
+
+0.95 to 0.99
+- Clear standard abbreviation expansion
+- Example: ROT CHKN -> Rotisserie Chicken
+- Example: KS ORG TOFU -> Kirkland Signature Organic Tofu
+
+0.85 to 0.94
+- Strong OCR cleanup or obvious abbreviation expansion with minor uncertainty
+- Example: CHERRY TOV -> Cherry Tomatoes on the Vine
+- Example: ORGSPRINGMIX -> Organic Spring Mix
+
+0.60 to 0.84
+- Partially understandable, but one or more tokens remain unclear
+- Example: ORG 4BRY 5LB -> Organic 4-Berry, 5 lb
+- Example: TENDERLOIN -> Tenderloin
+
+0.30 to 0.59
+- Highly ambiguous text
+- Example: SKO 5X -> SKO 5X
+- Example: TIRE EXT. -> Tire Ext.
+
+0.00 to 0.29
+- Cannot reliably determine meaning
+- Example: MISC -> Misc
+- Example: ITEM -> Item
+
+VERIFICATION RULES
+
+If confidence < 0.85:
+- set needsVerification to true
+
+If confidence >= 0.85:
+- set needsVerification to false
+
+Set ambiguous to true whenever:
+- more than one reasonable interpretation exists
+- a meaningful token remains unresolved
+- the normalized label is intentionally generic
+- an OCR correction is uncertain
+
+Set ambiguous to false only when the cleaned meaning is clear.
+
+OUTPUT RULES
+
+Return valid JSON only.
+Do not include markdown.
+Do not include explanations outside JSON.
+Return exactly one result for every input item.
+Preserve the original input order.
+Preserve the input index.
+Do not omit fields.
+Use an empty array when there are no alternatives.
+
+Return exactly this structure:
+
+{
+  "items": [
+    {
+      "index": 0,
+      "original": "string",
+      "normalizedName": "string",
+      "confidence": 0.00,
+      "ambiguous": true,
+      "needsVerification": true,
+      "possibleAlternatives": [],
+      "reason": "Short explanation based only on raw_name."
+    }
+  ]
+}`;
 
 // ============================================================
 // UTILITY FUNCTIONS
@@ -301,6 +579,7 @@ function normalizeParsedReceipt(parsed) {
       amount: round2(item.amount),
       originalAmount: toNumber(item.originalAmount),
       itemDiscount: toNumber(item.itemDiscount),
+      itemCode: item.itemCode ?? null,
       qty: toNumber(item.qty),
       unitPrice: toNumber(item.unitPrice),
       weightLbs: toNumber(item.weightLbs),
@@ -683,7 +962,134 @@ function resolveFinancialContradictions(normalized, reqId) {
 }
 
 // ============================================================
-// STAGE 9: CONFIDENCE + STATUS
+// STAGE 9: ITEM NAME NORMALIZATION
+// ============================================================
+
+const ITEM_NAME_NORMALIZATION_MODEL = "ministral-14b-latest";
+const ITEM_NAME_NORMALIZATION_TIMEOUT_MS = 20000;
+
+function withTimeout(promise, timeoutMs, label) {
+  let timeoutId;
+  const timeout = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => {
+      reject(new Error(`${label} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timeoutId));
+}
+
+function fallbackNameNormalization(receipt) {
+  return {
+    ...receipt,
+    items: (receipt.items || []).map(item => ({
+      ...item,
+      rawName: item.name,
+      normalizedName: item.name,
+      normalizationConfidence: 0,
+      normalizationAmbiguous: true,
+      needsNameVerification: true,
+      possibleNameAlternatives: [],
+      normalizationReason: "Normalization unavailable; preserved raw receipt text.",
+    })),
+  };
+}
+
+function validateItemNameNormalizationResponse(response, inputCount) {
+  const parsed = ItemNameNormalizationResponseSchema.parse(response);
+
+  if (parsed.items.length !== inputCount) {
+    throw new Error(`Expected ${inputCount} normalized items, received ${parsed.items.length}`);
+  }
+
+  const seen = new Set();
+  for (const item of parsed.items) {
+    if (item.index < 0 || item.index >= inputCount) {
+      throw new Error(`Unexpected normalized item index: ${item.index}`);
+    }
+    if (seen.has(item.index)) {
+      throw new Error(`Duplicate normalized item index: ${item.index}`);
+    }
+    seen.add(item.index);
+  }
+
+  for (let i = 0; i < inputCount; i++) {
+    if (!seen.has(i)) {
+      throw new Error(`Missing normalized item index: ${i}`);
+    }
+  }
+
+  return parsed;
+}
+
+async function normalizeItemNamesWithMistral(receipt, reqId) {
+  if (!receipt?.items?.length) {
+    return receipt;
+  }
+
+  const startedAt = Date.now();
+  console.log(`[${reqId}] Starting item-name normalization pass...`);
+  console.log(`[${reqId}]   - Model: ${ITEM_NAME_NORMALIZATION_MODEL}`);
+  console.log(`[${reqId}]   - Items sent: ${receipt.items.length}`);
+
+  const payload = {
+    merchant: receipt.merchant,
+    items: receipt.items.map((item, index) => ({
+      index,
+      raw_name: item.name,
+      item_code: item.itemCode ?? null,
+      price: item.amount,
+    })),
+  };
+
+  try {
+    const completion = await withTimeout(
+      client.chat.parse({
+        model: ITEM_NAME_NORMALIZATION_MODEL,
+        messages: [
+          { role: "system", content: ITEM_NAME_NORMALIZATION_PROMPT },
+          { role: "user", content: JSON.stringify(payload) },
+        ],
+        temperature: 0,
+        responseFormat: ItemNameNormalizationResponseSchema,
+      }),
+      ITEM_NAME_NORMALIZATION_TIMEOUT_MS,
+      "Item-name normalization"
+    );
+
+    const message = completion.choices?.[0]?.message;
+    const rawResponse = message?.parsed ?? JSON.parse(message?.content || "{}");
+    const validated = validateItemNameNormalizationResponse(rawResponse, receipt.items.length);
+    const byIndex = new Map(validated.items.map(item => [item.index, item]));
+
+    const normalizedReceipt = {
+      ...receipt,
+      items: receipt.items.map((item, index) => {
+        const aiResult = byIndex.get(index);
+        return {
+          ...item,
+          rawName: item.name,
+          normalizedName: aiResult.normalizedName,
+          normalizationConfidence: aiResult.confidence,
+          normalizationAmbiguous: aiResult.ambiguous,
+          needsNameVerification: aiResult.needsVerification,
+          possibleNameAlternatives: aiResult.possibleAlternatives,
+          normalizationReason: aiResult.reason,
+        };
+      }),
+    };
+
+    console.log(`[${reqId}] ✓ Item-name normalization complete in ${Date.now() - startedAt}ms (fallback=false)`);
+    return normalizedReceipt;
+  } catch (error) {
+    console.log(`[${reqId}] ⚠️ Item-name normalization failed: ${error.message}`);
+    console.log(`[${reqId}] ✓ Item-name normalization fallback complete in ${Date.now() - startedAt}ms (fallback=true)`);
+    return fallbackNameNormalization(receipt);
+  }
+}
+
+// ============================================================
+// STAGE 10: CONFIDENCE + STATUS
 // ============================================================
 
 function determineParseStatus(reconciliation, normalized, hasRefund, resolutionResult) {
@@ -769,12 +1175,22 @@ function buildApiResponse(parseResult, timings, reqId) {
     receiptDate: parsed.receiptDate,
     currency: parsed.currency || "USD",
     items: parsed.items.map(item => ({
-      name: item.name,
+      name: item.normalizedName || item.name,
+      rawName: item.rawName || item.name,
+      normalizedName: item.normalizedName || item.name,
+      itemCode: item.itemCode ?? null,
       amount: item.amount,
       qty: item.qty,
       unitPrice: item.unitPrice,
       weightLbs: item.weightLbs,
       confidence: item.confidence,
+      normalizationConfidence: item.normalizationConfidence ?? 0,
+      normalizationAmbiguous: item.normalizationAmbiguous ?? true,
+      needsNameVerification: item.needsNameVerification ?? true,
+      possibleNameAlternatives: item.possibleNameAlternatives ?? [],
+      normalizationReason:
+        item.normalizationReason ??
+        "Normalization unavailable; preserved raw receipt text.",
     })),
     subtotal: parsed.subtotal,
     tax: parsed.tax,
@@ -803,6 +1219,19 @@ function buildApiResponse(parseResult, timings, reqId) {
       ocr_text: ocrText,
       rejected_items: rejected || [],
       has_refund_indicators: hasRefund,
+      item_name_normalization: {
+        model: ITEM_NAME_NORMALIZATION_MODEL,
+        enabled: true,
+        items: parsed.items.map(item => ({
+          rawName: item.rawName || item.name,
+          normalizedName: item.normalizedName || item.name,
+          confidence: item.normalizationConfidence ?? 0,
+          ambiguous: item.normalizationAmbiguous ?? true,
+          needsVerification: item.needsNameVerification ?? true,
+          alternatives: item.possibleNameAlternatives ?? [],
+          reason: item.normalizationReason ?? null,
+        })),
+      },
       contradiction_resolution: {
         suspicious_items_detected: resolutionResult.suspicious.length,
         suspicious_items: resolutionResult.suspicious.map(s => ({
@@ -881,6 +1310,7 @@ app.post("/parse-receipt", requireAppAuth, async (req, res) => {
     let normalized = null;
     let rejected = [];
     let resolutionResult = null;
+    let normalizationMs = 0;
     
     if (parsed) {
       normalized = normalizeParsedReceipt(parsed);
@@ -891,6 +1321,10 @@ app.post("/parse-receipt", requireAppAuth, async (req, res) => {
       // Contradiction resolution layer
       resolutionResult = resolveFinancialContradictions(normalized, reqId);
       normalized = resolutionResult.receipt;
+
+      const normalizationStart = Date.now();
+      normalized = await normalizeItemNamesWithMistral(normalized, reqId);
+      normalizationMs = Date.now() - normalizationStart;
     }
 
     // Reconciliation
@@ -935,7 +1369,7 @@ app.post("/parse-receipt", requireAppAuth, async (req, res) => {
 
     const response = buildApiResponse(
       { parsed: normalized, ocrText, result, reconciliation, rejected, resolutionResult },
-      { parse_ms: parseMs, total_ms: totalMs },
+      { parse_ms: parseMs, normalization_ms: normalizationMs, total_ms: totalMs },
       reqId
     );
 
@@ -959,19 +1393,6 @@ app.post("/parse-receipt", requireAppAuth, async (req, res) => {
       } catch {}
     }
   }
-});
-
-
-app.get("/", (req, res) => {
-  res.json({
-    ok: true,
-    message: "Dutchie backend is running 🚀",
-    endpoints: {
-      health: "/health",
-      parseReceipt: "/parse-receipt",
-    },
-    version: "2.0.1",
-  });
 });
 
 app.get("/health", (req, res) => {
