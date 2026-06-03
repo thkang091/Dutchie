@@ -1584,7 +1584,7 @@ app.post("/normalize-item-names", requireAppAuth, async (req, res) => {
       })),
     });
   } catch (error) {
-    console.error(`[${reqId}] ✗ OPTIONAL NORMALIZATION ERROR:`, error);
+    console.error(`[${reqId}] ✗ OPTIONAL NORMALIZATION ERRORS:`, error);
     return res.status(500).json({
       error: "Failed to normalize item names",
       detail: error?.message || "unknown_error",
