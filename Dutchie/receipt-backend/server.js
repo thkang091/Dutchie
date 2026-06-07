@@ -3,6 +3,7 @@ import cors from "cors";
 import dotenv from "dotenv";
 import fs from "fs";
 import path from "path";
+import crypto from "crypto";
 import { Mistral } from "@mistralai/mistralai";
 import { z } from "zod";
 import { responseFormatFromZodObject } from "@mistralai/mistralai/extra/structChat.js";
@@ -19,6 +20,22 @@ const MISTRAL_API_KEY = process.env.MISTRAL_API_KEY || "";
 const TEMP_DIR = path.resolve(process.cwd(), "tmp_receipts");
 const SAVE_TEMP_RECEIPTS = process.env.SAVE_TEMP_RECEIPTS === "true";
 const RECOMMENDED_IMAGE_MAX_BYTES = 2 * 1024 * 1024;
+const MISTRAL_OCR_MODEL = process.env.MISTRAL_OCR_MODEL || "mistral-ocr-latest";
+const ENABLE_DEBUG_RESPONSE =
+  process.env.ENABLE_DEBUG_RESPONSE === "true" &&
+  process.env.NODE_ENV !== "production";
+const MAX_UPLOAD_BYTES = Number(process.env.MAX_UPLOAD_BYTES || 20 * 1024 * 1024);
+const MAX_PDF_PAGES = Number(process.env.MAX_PDF_PAGES || 12);
+const OCR_LOW_CONFIDENCE_THRESHOLD = Number(process.env.OCR_LOW_CONFIDENCE_THRESHOLD || 0.75);
+const ALLOWED_MIME_TYPES = new Set([
+  "application/pdf",
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+  "image/heic",
+]);
+const parseCache = new Map();
+const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 10 * 60 * 1000);
 
 // ============================================================
 // ENVIRONMENT VALIDATION
@@ -128,6 +145,43 @@ const ItemNameNormalizationResponseSchema = z.object({
   items: z.array(NormalizedItemNameSchema),
 });
 
+const BankTransactionSchema = z.object({
+  transactionDate: z.string().nullable().optional(),
+  postedDate: z.string().nullable().optional(),
+  description: z.string(),
+  amount: z.number(),
+  direction: z.enum(["debit", "credit", "unknown"]),
+  status: z.enum(["posted", "pending", "unknown"]),
+  balanceAfterTransaction: z.number().nullable().optional(),
+  sourceText: z.string().optional().default(""),
+  confidence: z.number().nullable().optional(),
+});
+
+const BankDocumentSchema = z.object({
+  documentType: z.enum([
+    "bank_statement",
+    "account_activity_screenshot",
+    "credit_card_activity_screenshot",
+  ]),
+  institutionName: z.string().nullable().optional(),
+  accountName: z.string().nullable().optional(),
+  accountLast4: z.string().nullable().optional(),
+  currency: z.string().nullable().optional(),
+  statementPeriod: z.object({
+    startDate: z.string().nullable().optional(),
+    endDate: z.string().nullable().optional(),
+  }).optional().default({ startDate: null, endDate: null }),
+  balances: z.object({
+    openingBalance: z.number().nullable().optional(),
+    closingBalance: z.number().nullable().optional(),
+    availableBalance: z.number().nullable().optional(),
+    currentBalance: z.number().nullable().optional(),
+  }).optional().default({}),
+  transactions: z.array(BankTransactionSchema),
+  partialDocument: z.boolean().optional().default(false),
+  warnings: z.array(z.string()).optional().default([]),
+});
+
 const SAFE_ITEM_ABBREVIATIONS = {
   KS: "Kirkland Signature",
   ORG: "Organic",
@@ -158,6 +212,212 @@ const SAFE_OCR_REPLACEMENTS = [
   [/\bCHOPONION\b/gi, "Chopped Onion"],
   [/\bCHIPTLE\b/gi, "Chipotle"],
 ];
+
+// ============================================================
+// FINANCIAL DOCUMENT HELPERS
+// ============================================================
+
+function toMinorUnits(value, currency = "USD") {
+  if (value == null || Number.isNaN(Number(value))) return null;
+  const decimals = ["JPY", "KRW"].includes(String(currency).toUpperCase()) ? 0 : 2;
+  return Math.round(Number(value) * Math.pow(10, decimals));
+}
+
+function fromMinorUnits(value, currency = "USD") {
+  if (value == null) return null;
+  const decimals = ["JPY", "KRW"].includes(String(currency).toUpperCase()) ? 0 : 2;
+  return Number((value / Math.pow(10, decimals)).toFixed(decimals));
+}
+
+function moneyEqualWithinTolerance(a, b, toleranceMinorUnits = 1) {
+  if (a == null || b == null) return false;
+  return Math.abs(a - b) <= toleranceMinorUnits;
+}
+
+function detectMimeType(buffer, claimedMimeType = "") {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 12) return null;
+  if (buffer.subarray(0, 4).toString("latin1") === "%PDF") return "application/pdf";
+  if (buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) return "image/jpeg";
+  if (buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return "image/png";
+  if (buffer.subarray(0, 4).toString("latin1") === "RIFF" && buffer.subarray(8, 12).toString("latin1") === "WEBP") return "image/webp";
+  const brand = buffer.subarray(4, 12).toString("latin1");
+  if (brand.includes("ftypheic") || brand.includes("ftypheix") || brand.includes("ftyphevc") || brand.includes("ftypmif1")) return "image/heic";
+  return ALLOWED_MIME_TYPES.has(claimedMimeType) ? claimedMimeType : null;
+}
+
+function validateUploadBuffer(buffer, claimedMimeType) {
+  if (!buffer || buffer.length < 128) {
+    return { ok: false, status: 400, code: "UNSUPPORTED_FILE_TYPE", message: "File is too small or corrupt." };
+  }
+  if (buffer.length > MAX_UPLOAD_BYTES) {
+    return { ok: false, status: 413, code: "FILE_TOO_LARGE", message: "This file is too large to parse." };
+  }
+  const actualMimeType = detectMimeType(buffer, claimedMimeType);
+  if (!actualMimeType || !ALLOWED_MIME_TYPES.has(actualMimeType)) {
+    return { ok: false, status: 415, code: "UNSUPPORTED_FILE_TYPE", message: "Unsupported file type. Upload a PDF, JPG, PNG, WEBP, or HEIC file." };
+  }
+  return { ok: true, mimeType: actualMimeType };
+}
+
+function getTempExtension(mimeType) {
+  if (mimeType === "application/pdf") return ".pdf";
+  if (mimeType === "image/png") return ".png";
+  if (mimeType === "image/webp") return ".webp";
+  if (mimeType === "image/heic") return ".heic";
+  return ".jpg";
+}
+
+function buildMistralDocument(buffer, mimeType) {
+  const base64 = buffer.toString("base64");
+  const dataUrl = `data:${mimeType};base64,${base64}`;
+  if (mimeType === "application/pdf") return { type: "document_url", documentUrl: dataUrl };
+  return { type: "image_url", imageUrl: dataUrl };
+}
+
+function decodeBase64Payload(value) {
+  let base64Data = String(value || "");
+  const idx = base64Data.indexOf("base64,");
+  if (idx >= 0) base64Data = base64Data.slice(idx + 7);
+  return Buffer.from(base64Data, "base64");
+}
+
+function fileHash(buffer) {
+  return crypto.createHash("sha256").update(buffer).digest("hex");
+}
+
+function getCachedParse(hash, namespace) {
+  const key = `${namespace}:${hash}`;
+  const cached = parseCache.get(key);
+  if (!cached) return null;
+  if (Date.now() - cached.createdAt > CACHE_TTL_MS) {
+    parseCache.delete(key);
+    return null;
+  }
+  return cached.value;
+}
+
+function setCachedParse(hash, namespace, value) {
+  parseCache.set(`${namespace}:${hash}`, { createdAt: Date.now(), value });
+}
+
+function parseAndValidateDocumentAnnotation(annotation, schema) {
+  if (!annotation) {
+    const error = new Error("No structured annotation returned by Mistral");
+    error.code = "MALFORMED_ANNOTATION";
+    throw error;
+  }
+  let raw;
+  try {
+    raw = JSON.parse(annotation);
+  } catch (err) {
+    const error = new Error("Structured annotation JSON is malformed");
+    error.code = "MALFORMED_ANNOTATION";
+    error.cause = err;
+    throw error;
+  }
+  try {
+    return schema.parse(raw);
+  } catch (err) {
+    const error = new Error("Structured annotation failed schema validation");
+    error.code = "SCHEMA_VALIDATION_FAILED";
+    error.cause = err;
+    throw error;
+  }
+}
+
+function redactSensitiveText(value) {
+  return String(value || "")
+    .replace(/(?:\d[ -]?){13,19}/g, "[REDACTED_CARD_OR_ACCOUNT]")
+    .replace(/(account|acct|card)\s*(?:number|no|#)?\s*[:#]?\s*[A-Z0-9* -]{6,}/gi, "$1 [REDACTED]");
+}
+
+function classifyFinancialDocument({ ocrText, uploadIntent, sourceType, mimeType }) {
+  const text = String(ocrText || "").toLowerCase();
+  const hasReceiptSignals = /(receipt|subtotal|sales tax|tax|tip|gratuity|total due|balance due|items sold|cashier|merchant)/.test(text);
+  const hasStatementSignals = /(statement period|opening balance|closing balance|account number|account summary|deposits|withdrawals)/.test(text);
+  const hasActivitySignals = /(account activity|transaction history|pending|posted|available balance|current balance|deposit|withdrawal|transfer)/.test(text);
+  const hasCardSignals = /(credit card|card activity|minimum payment|payment due|statement balance|available credit|cash back|purchase apr)/.test(text);
+  const hasTransactionRows = (text.match(/\$?[-+]?\d{1,3}(?:,\d{3})*\.\d{2}/g) || []).length >= 2;
+  if (hasStatementSignals && hasTransactionRows) return { documentType: "bank_statement", confidence: 0.95, reason: "Statement period, balances, or account summary signals were detected with transaction amounts." };
+  if (hasCardSignals && hasTransactionRows) return { documentType: "credit_card_activity_screenshot", confidence: 0.92, reason: "Credit-card activity language and transaction amounts were detected." };
+  if (hasActivitySignals && hasTransactionRows) return { documentType: "account_activity_screenshot", confidence: 0.9, reason: "Account activity language and visible transaction rows were detected." };
+  if (hasReceiptSignals && uploadIntent !== "scan_statement") return { documentType: "receipt", confidence: 0.86, reason: "Receipt-style totals and purchased-item signals were detected." };
+  if (hasReceiptSignals && uploadIntent === "scan_statement") return { documentType: "ambiguous", confidence: 0.62, reason: "The upload was intended as a statement, but receipt-style fields were detected." };
+  if (hasTransactionRows && uploadIntent === "scan_statement") return { documentType: sourceType === "pdf" || mimeType === "application/pdf" ? "bank_statement" : "account_activity_screenshot", confidence: 0.72, reason: "Visible transaction-like rows were detected, but document labels are limited." };
+  return { documentType: "unsupported", confidence: 0.25, reason: "No supported receipt, statement, or account-activity evidence was detected." };
+}
+
+const BANK_DOCUMENT_PROMPT = `You extract bank statements and banking account activity screenshots.
+
+Extract only values visibly supported by the document.
+Never invent a transaction, balance, account name, account number, date, status, or statement period.
+Return null when a value is absent or unclear.
+Extract only visible transactions.
+If the screenshot appears cropped or rows appear cut off, set partialDocument = true.
+Keep pending and posted transactions separate.
+Do not return a full bank-account number or full credit-card number. Only return last four digits when visibly present.
+Preserve the original visible transaction row in sourceText.
+Return JSON only.`;
+
+function normalizeBankDocument(doc, classifiedType) {
+  const sanitizedLast4 = doc.accountLast4 ? String(doc.accountLast4).replace(/\D/g, "").slice(-4) : null;
+  return {
+    documentType: ["bank_statement", "account_activity_screenshot", "credit_card_activity_screenshot"].includes(classifiedType) ? classifiedType : doc.documentType,
+    institutionName: doc.institutionName || null,
+    accountName: doc.accountName || null,
+    accountLast4: sanitizedLast4,
+    currency: doc.currency || "USD",
+    statementPeriod: {
+      startDate: doc.statementPeriod?.startDate || null,
+      endDate: doc.statementPeriod?.endDate || null,
+    },
+    balances: {
+      openingBalance: toNumber(doc.balances?.openingBalance),
+      closingBalance: toNumber(doc.balances?.closingBalance),
+      availableBalance: toNumber(doc.balances?.availableBalance),
+      currentBalance: toNumber(doc.balances?.currentBalance),
+    },
+    transactions: (doc.transactions || []).map(tx => ({
+      transactionDate: tx.transactionDate || null,
+      postedDate: tx.postedDate || null,
+      description: redactSensitiveText(tx.description),
+      amount: round2(Math.abs(Number(tx.amount || 0))),
+      direction: tx.direction || "unknown",
+      status: tx.status || "unknown",
+      balanceAfterTransaction: toNumber(tx.balanceAfterTransaction),
+      sourceText: redactSensitiveText(tx.sourceText || tx.description || ""),
+      confidence: tx.confidence ?? null,
+    })).filter(tx => tx.description && tx.amount > 0),
+    partialDocument: !!doc.partialDocument,
+    warnings: (doc.warnings || []).map(redactSensitiveText),
+  };
+}
+
+function reconcileBankDocument(bankDocument) {
+  const currency = bankDocument.currency || "USD";
+  const posted = bankDocument.transactions.filter(tx => tx.status !== "pending");
+  const pending = bankDocument.transactions.filter(tx => tx.status === "pending");
+  const postedDebits = posted.filter(tx => tx.direction === "debit").reduce((sum, tx) => sum + (toMinorUnits(tx.amount, currency) || 0), 0);
+  const postedCredits = posted.filter(tx => tx.direction === "credit").reduce((sum, tx) => sum + (toMinorUnits(tx.amount, currency) || 0), 0);
+  const pendingTotal = pending.reduce((sum, tx) => sum + (toMinorUnits(tx.amount, currency) || 0), 0);
+  const opening = toMinorUnits(bankDocument.balances.openingBalance, currency);
+  const closing = toMinorUnits(bankDocument.balances.closingBalance, currency);
+  if (opening != null && closing != null) {
+    const calculatedClosing = opening + postedCredits - postedDebits;
+    const verified = moneyEqualWithinTolerance(calculatedClosing, closing);
+    return {
+      status: verified ? "verified" : "ambiguous",
+      reason: verified ? "Opening balance plus posted credits minus posted debits matches the closing balance." : "Visible balances do not reconcile with visible posted transactions; the document may be partial or OCR may need review.",
+      visiblePostedDebitTotal: fromMinorUnits(postedDebits, currency),
+      visiblePostedCreditTotal: fromMinorUnits(postedCredits, currency),
+      pendingTransactionTotal: fromMinorUnits(pendingTotal, currency),
+      calculatedClosingBalance: fromMinorUnits(calculatedClosing, currency),
+      totalGap: fromMinorUnits(Math.abs(calculatedClosing - closing), currency),
+    };
+  }
+  if (bankDocument.partialDocument) return { status: "partially_verified", reason: "This appears to be a partial screenshot. Only visible transactions were extracted.", visiblePostedDebitTotal: fromMinorUnits(postedDebits, currency), visiblePostedCreditTotal: fromMinorUnits(postedCredits, currency), pendingTransactionTotal: fromMinorUnits(pendingTotal, currency) };
+  return { status: "not_applicable", reason: "No opening balance, closing balance, or running balance is visible.", visiblePostedDebitTotal: fromMinorUnits(postedDebits, currency), visiblePostedCreditTotal: fromMinorUnits(postedCredits, currency), pendingTransactionTotal: fromMinorUnits(pendingTotal, currency) };
+}
 
 // ============================================================
 // MISTRAL EXTRACTION PROMPT
@@ -222,6 +482,7 @@ DISCOUNT ACCURACY:
 - Do not drop an item-specific discount just because a total savings line also exists.
 - If the receipt only shows "YOU SAVED" or "TOTAL SAVINGS" without a clear item attachment, classify it as orderLevelDiscount or notes, not itemDiscount.
 - If uncertain whether a discount belongs to a specific item, keep the item amount visible on the purchased item and mention the uncertainty in notes.
+- Some promo labels describe savings without reducing the receipt total. If subtracting an itemDiscount makes items + charges lower than grandTotal by exactly that discount amount, keep the item amount that reconciles to grandTotal and do not mark it as itemDiscount.
 
 MULTI-LINE MERGING:
 OCR often splits items across lines - merge them carefully:
@@ -563,37 +824,56 @@ function hasRefundIndicators(text) {
 // STAGE 2: PRIMARY OCR / STRUCTURED PARSE
 // ============================================================
 
-async function callMistralOCR(imageBuffer, mimeType, reqId) {
-  console.log(`[${reqId}] Calling Mistral OCR (single-pass)...`);
-  
-  const base64Image = imageBuffer.toString("base64");
-  const dataUrl = `data:${mimeType};base64,${base64Image}`;
+async function runMistralOcr({
+  buffer,
+  mimeType,
+  reqId,
+  documentAnnotationFormat,
+  documentAnnotationPrompt,
+}) {
+  console.log(`[${reqId}] Calling Mistral OCR (${mimeType})...`);
 
   const result = await client.ocr.process({
-    model: "mistral-ocr-latest",
-    document: {
-      type: "image_url",
-      imageUrl: dataUrl,
-    },
+    model: MISTRAL_OCR_MODEL,
+    document: buildMistralDocument(buffer, mimeType),
+    confidenceScoresGranularity: "word",
+    documentAnnotationFormat,
+    documentAnnotationPrompt,
+  });
+
+  const pages = result.pages || [];
+  const ocrText = pages.map(page => page.markdown || "").join("\n\n");
+
+  return {
+    ocrText,
+    pages,
+    pageCount: pages.length || 1,
+    model: MISTRAL_OCR_MODEL,
+    wordConfidenceScores: pages.flatMap(page => page.words || page.wordConfidenceScores || []),
+    lowConfidenceFields: [],
+    documentAnnotation: result.documentAnnotation || null,
+    result,
+  };
+}
+
+async function callMistralOCR(imageBuffer, mimeType, reqId) {
+  const ocr = await runMistralOcr({
+    buffer: imageBuffer,
+    mimeType,
+    reqId,
     documentAnnotationFormat: responseFormatFromZodObject(MistralReceiptSchema),
     documentAnnotationPrompt: EXTRACTION_PROMPT,
   });
 
-  const ocrText = result.pages.map(page => page.markdown).join("\n\n");
-  
   let parsed = null;
-  if (result.documentAnnotation) {
-    try {
-      parsed = JSON.parse(result.documentAnnotation);
-      console.log(`[${reqId}] ✓ Structured extraction successful`);
-    } catch (err) {
-      console.log(`[${reqId}] ⚠️ Failed to parse documentAnnotation: ${err.message}`);
-    }
-  } else {
-    console.log(`[${reqId}] ⚠️ No documentAnnotation returned`);
+  try {
+    parsed = parseAndValidateDocumentAnnotation(ocr.documentAnnotation, MistralReceiptSchema);
+    console.log(`[${reqId}] ✓ Structured extraction successful`);
+  } catch (err) {
+    console.log(`[${reqId}] ⚠️ Structured extraction validation failed: ${err.message}`);
   }
 
-  return { parsed, ocrText, result };
+  return { parsed, ocrText: ocr.ocrText, result: ocr.result, ocr };
 }
 
 // ============================================================
@@ -839,6 +1119,69 @@ function reconcileReceipt(normalized) {
   };
 }
 
+function sumPositiveItemDiscounts(items) {
+  return round2((items || []).reduce((sum, item) => {
+    const discount = item.itemDiscount ?? 0;
+    return sum + (discount > 0 ? discount : 0);
+  }, 0));
+}
+
+function buildRestoreItemDiscountCandidate(normalized, reqId) {
+  const reconciliation = reconcileReceipt(normalized);
+  const grandTotal = normalized.grandTotal;
+
+  if (grandTotal == null || reconciliation.calculatedFromItems == null) {
+    return null;
+  }
+
+  const totalItemDiscounts = sumPositiveItemDiscounts(normalized.items);
+  if (totalItemDiscounts <= 0) {
+    return null;
+  }
+
+  const signedTotalGap = round2(grandTotal - reconciliation.calculatedFromItems);
+  if (signedTotalGap <= 0) {
+    return null;
+  }
+
+  if (Math.abs(signedTotalGap - totalItemDiscounts) > 0.01) {
+    return null;
+  }
+
+  console.log(
+    `[${reqId}] Item discounts match positive total gap (${signedTotalGap.toFixed(2)}); trying non-subtractive discount repair`
+  );
+
+  return {
+    label: "restore_non_subtractive_item_discounts",
+    receipt: {
+      ...normalized,
+      items: normalized.items.map(item => {
+        const discount = item.itemDiscount ?? 0;
+        if (discount <= 0) {
+          return item;
+        }
+
+        const restoredAmount = round2((item.amount || 0) + discount);
+        return {
+          ...item,
+          amount: restoredAmount,
+          originalAmount: null,
+          itemDiscount: null,
+          itemDiscountLabel: null,
+        };
+      }),
+      notes: [
+        normalized.notes,
+        "A printed promo/savings label matched the receipt total gap, so it was treated as non-subtractive display text.",
+      ].filter(Boolean).join(" "),
+    },
+    changes: [
+      `Restored ${totalItemDiscounts.toFixed(2)} to item amounts because the receipt total did not subtract those item discounts`,
+    ],
+  };
+}
+
 // ============================================================
 // STAGE 6: REPAIR CANDIDATE BUILDER
 // ============================================================
@@ -852,6 +1195,11 @@ function buildRepairCandidates(normalized, suspicious, reqId) {
     receipt: normalized,
     changes: [],
   });
+
+  const itemDiscountRepair = buildRestoreItemDiscountCandidate(normalized, reqId);
+  if (itemDiscountRepair) {
+    candidates.push(itemDiscountRepair);
+  }
 
   // Candidate 1: Drop each highly suspicious item
   suspicious
@@ -969,6 +1317,34 @@ function resolveFinancialContradictions(normalized, reqId) {
   );
 
   if (suspicious.length === 0) {
+    const itemDiscountRepair = buildRestoreItemDiscountCandidate(normalized, reqId);
+
+    if (itemDiscountRepair) {
+      const scored = [
+        { label: "original", receipt: normalized, changes: [] },
+        itemDiscountRepair,
+      ].map(c => scoreInterpretation(c, reqId));
+      scored.sort((a, b) => a.score - b.score);
+
+      const best = scored[0];
+      console.log(`[${reqId}] No suspicious items detected, but discount repair was evaluated`);
+      console.log(`[${reqId}] ✓ Selected: ${best.label} (score: ${best.score.toFixed(3)})`);
+
+      if (best.changes.length > 0) {
+        console.log(`[${reqId}] Changes applied:`);
+        best.changes.forEach(change => console.log(`[${reqId}]   - ${change}`));
+      }
+
+      return {
+        receipt: best.receipt,
+        selectedCandidate: best.label,
+        candidatesTried: scored.length,
+        suspicious: [],
+        changes: best.changes,
+        allCandidates: scored,
+      };
+    }
+
     console.log(`[${reqId}] No suspicious items detected - using original interpretation`);
     return {
       receipt: normalized,
@@ -1289,7 +1665,7 @@ function buildApiResponse(parseResult, timings, reqId) {
     route,
     routeReason,
     timings,
-    debug: {
+    debug: ENABLE_DEBUG_RESPONSE ? {
       parser_version: "production_v2_contradiction_resolver_fixed",
       model_used: result?.model || "mistral-ocr-latest",
       ocr_text_length: ocrText.length,
@@ -1346,7 +1722,7 @@ function buildApiResponse(parseResult, timings, reqId) {
         vs_grand_total: `${reconciliation.calculatedFromItems} vs ${parsed.grandTotal ?? "null"}`,
         gap: reconciliation.totalGap != null ? `$${reconciliation.totalGap.toFixed(2)}` : "N/A",
       },
-    },
+    } : undefined
   };
 }
 
@@ -1396,6 +1772,14 @@ app.post("/parse-receipt", requireAppAuth, async (req, res) => {
     }
 
     const buffer = Buffer.from(base64Data, "base64");
+    const uploadValidation = validateUploadBuffer(buffer, mimeType);
+    if (!uploadValidation.ok) {
+      return res.status(uploadValidation.status).json({
+        error: { code: uploadValidation.code, message: uploadValidation.message },
+        timings,
+      });
+    }
+    const safeMimeType = uploadValidation.mimeType;
     timings.decode_ms = Date.now() - decodeStart;
     console.log(`[${reqId}] Image size: ${(buffer.length / 1024).toFixed(2)} KB`);
 
@@ -1410,7 +1794,7 @@ app.post("/parse-receipt", requireAppAuth, async (req, res) => {
 
     if (SAVE_TEMP_RECEIPTS) {
       const tempFileWriteStart = Date.now();
-      const ext = mimeType.includes("png") ? ".png" : ".jpg";
+      const ext = getTempExtension(safeMimeType);
       const filename = `receipt_${Date.now()}_${Math.random().toString(36).slice(2)}${ext}`;
       tempImagePath = path.join(TEMP_DIR, filename);
       await fs.promises.writeFile(tempImagePath, buffer);
@@ -1418,7 +1802,7 @@ app.post("/parse-receipt", requireAppAuth, async (req, res) => {
     }
 
     const ocrStart = Date.now();
-    const { parsed, ocrText, result } = await callMistralOCR(buffer, mimeType, reqId);
+    const { parsed, ocrText, result } = await callMistralOCR(buffer, safeMimeType, reqId);
     timings.ocr_ms = Date.now() - ocrStart;
     
     let normalized = null;
@@ -1520,6 +1904,99 @@ app.post("/parse-receipt", requireAppAuth, async (req, res) => {
   }
 });
 
+app.get("/", (req, res) => {
+  res.json({ ok: true, service: "financial-document-parser", health: "/health" });
+});
+
+app.post("/parse-financial-document", requireAppAuth, async (req, res) => {
+  const reqId = `req_${Date.now().toString(36)}`;
+  const startedAt = Date.now();
+  let tempPath = null;
+
+  console.log("\n" + "=".repeat(80));
+  console.log(`[${reqId}] FINANCIAL DOCUMENT PARSE REQUEST`);
+  console.log("=".repeat(80));
+
+  try {
+    const { fileBase64, imageBase64, mimeType = "image/jpeg", uploadIntent = "scan_statement", sourceType = "screenshot" } = req.body || {};
+    const encoded = fileBase64 || imageBase64;
+    if (!encoded) return res.status(400).json({ ok: false, error: { code: "MISSING_FILE", message: "Missing fileBase64 in request body." } });
+
+    const buffer = decodeBase64Payload(encoded);
+    const uploadValidation = validateUploadBuffer(buffer, mimeType);
+    if (!uploadValidation.ok) return res.status(uploadValidation.status).json({ ok: false, error: { code: uploadValidation.code, message: uploadValidation.message } });
+
+    const safeMimeType = uploadValidation.mimeType;
+    const hash = fileHash(buffer);
+    const cached = getCachedParse(hash, "financial_document");
+    if (cached) return res.json(cached);
+
+    if (SAVE_TEMP_RECEIPTS) {
+      const filename = `financial_${Date.now()}_${Math.random().toString(36).slice(2)}${getTempExtension(safeMimeType)}`;
+      tempPath = path.join(TEMP_DIR, filename);
+      await fs.promises.writeFile(tempPath, buffer);
+    }
+
+    const ocr = await runMistralOcr({
+      buffer,
+      mimeType: safeMimeType,
+      reqId,
+      documentAnnotationFormat: responseFormatFromZodObject(BankDocumentSchema),
+      documentAnnotationPrompt: BANK_DOCUMENT_PROMPT,
+    });
+
+    if (safeMimeType === "application/pdf" && ocr.pageCount > MAX_PDF_PAGES) {
+      return res.status(413).json({ ok: false, error: { code: "PDF_PAGE_LIMIT_EXCEEDED", message: `This PDF has ${ocr.pageCount} pages. The current limit is ${MAX_PDF_PAGES} pages.` } });
+    }
+
+    const classification = classifyFinancialDocument({ ocrText: ocr.ocrText, uploadIntent, sourceType, mimeType: safeMimeType });
+    const baseResponse = {
+      ok: true,
+      parseVersion: "financial_doc_parser_v1",
+      documentType: classification.documentType,
+      classification: { confidence: classification.confidence, reason: classification.reason },
+      data: {},
+      reconciliation: { status: "not_applicable", reason: "No reconciliation was run for this document type." },
+      warnings: [],
+      reviewRequired: false,
+      ocr: { model: ocr.model, pageCount: ocr.pageCount, lowConfidenceFields: ocr.lowConfidenceFields },
+    };
+
+    if (["unsupported", "ambiguous"].includes(classification.documentType)) {
+      const response = { ...baseResponse, reviewRequired: true, warnings: [classification.reason] };
+      setCachedParse(hash, "financial_document", response);
+      return res.json(response);
+    }
+
+    const bankRaw = parseAndValidateDocumentAnnotation(ocr.documentAnnotation, BankDocumentSchema);
+    const bankDocument = normalizeBankDocument(bankRaw, classification.documentType);
+    const reconciliation = reconcileBankDocument(bankDocument);
+    const warnings = [...(bankDocument.warnings || [])];
+    if (bankDocument.partialDocument) warnings.push("This appears to be a partial screenshot. Only the visible transactions were imported.");
+    if (bankDocument.transactions.length === 0) warnings.push("No visible transactions were detected.");
+
+    const response = {
+      ...baseResponse,
+      documentType: bankDocument.documentType,
+      data: bankDocument,
+      reconciliation,
+      warnings,
+      reviewRequired: bankDocument.transactions.length === 0 || classification.confidence < 0.75,
+    };
+    setCachedParse(hash, "financial_document", response);
+    console.log(`[${reqId}] ✓ Financial document parse complete in ${Date.now() - startedAt}ms type=${response.documentType}`);
+    return res.json(response);
+  } catch (error) {
+    const code = error?.code || (error?.message?.toLowerCase().includes("timeout") ? "MISTRAL_TIMEOUT" : "UNKNOWN_PARSE_ERROR");
+    console.error(`[${reqId}] ✗ FINANCIAL DOCUMENT ERROR:`, code, error?.message);
+    return res.status(code === "MALFORMED_ANNOTATION" || code === "SCHEMA_VALIDATION_FAILED" ? 422 : 500).json({ ok: false, error: { code, message: error?.message || "Failed to parse financial document." } });
+  } finally {
+    if (SAVE_TEMP_RECEIPTS && tempPath) {
+      try { await fs.promises.unlink(tempPath); } catch {}
+    }
+  }
+});
+
 app.post("/normalize-item-names", requireAppAuth, async (req, res) => {
   const reqId = `req_${Date.now().toString(36)}`;
 
@@ -1584,7 +2061,7 @@ app.post("/normalize-item-names", requireAppAuth, async (req, res) => {
       })),
     });
   } catch (error) {
-    console.error(`[${reqId}] ✗ OPTIONAL NORMALIZATION ERRORS:`, error);
+    console.error(`[${reqId}] ✗ OPTIONAL NORMALIZATION ERROR:`, error);
     return res.status(500).json({
       error: "Failed to normalize item names",
       detail: error?.message || "unknown_error",
