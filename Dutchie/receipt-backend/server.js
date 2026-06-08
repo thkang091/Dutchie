@@ -146,15 +146,15 @@ const ItemNameNormalizationResponseSchema = z.object({
 });
 
 const BankTransactionSchema = z.object({
-  transactionDate: z.string().nullable().optional(),
-  postedDate: z.string().nullable().optional(),
+  transactionDate: z.string().nullable(),
+  postedDate: z.string().nullable(),
   description: z.string(),
   amount: z.number(),
   direction: z.enum(["debit", "credit", "unknown"]),
   status: z.enum(["posted", "pending", "unknown"]),
-  balanceAfterTransaction: z.number().nullable().optional(),
-  sourceText: z.string().optional().default(""),
-  confidence: z.number().nullable().optional(),
+  balanceAfterTransaction: z.number().nullable(),
+  sourceText: z.string(),
+  confidence: z.number().nullable(),
 });
 
 const BankDocumentSchema = z.object({
@@ -163,23 +163,23 @@ const BankDocumentSchema = z.object({
     "account_activity_screenshot",
     "credit_card_activity_screenshot",
   ]),
-  institutionName: z.string().nullable().optional(),
-  accountName: z.string().nullable().optional(),
-  accountLast4: z.string().nullable().optional(),
-  currency: z.string().nullable().optional(),
+  institutionName: z.string().nullable(),
+  accountName: z.string().nullable(),
+  accountLast4: z.string().nullable(),
+  currency: z.string().nullable(),
   statementPeriod: z.object({
-    startDate: z.string().nullable().optional(),
-    endDate: z.string().nullable().optional(),
-  }).optional().default({ startDate: null, endDate: null }),
+    startDate: z.string().nullable(),
+    endDate: z.string().nullable(),
+  }),
   balances: z.object({
-    openingBalance: z.number().nullable().optional(),
-    closingBalance: z.number().nullable().optional(),
-    availableBalance: z.number().nullable().optional(),
-    currentBalance: z.number().nullable().optional(),
-  }).optional().default({}),
+    openingBalance: z.number().nullable(),
+    closingBalance: z.number().nullable(),
+    availableBalance: z.number().nullable(),
+    currentBalance: z.number().nullable(),
+  }),
   transactions: z.array(BankTransactionSchema),
-  partialDocument: z.boolean().optional().default(false),
-  warnings: z.array(z.string()).optional().default([]),
+  partialDocument: z.boolean(),
+  warnings: z.array(z.string()),
 });
 
 const SAFE_ITEM_ABBREVIATIONS = {
@@ -327,16 +327,16 @@ function parseAndValidateDocumentAnnotation(annotation, schema) {
 
 function redactSensitiveText(value) {
   return String(value || "")
-    .replace(/(?:\d[ -]?){13,19}/g, "[REDACTED_CARD_OR_ACCOUNT]")
-    .replace(/(account|acct|card)\s*(?:number|no|#)?\s*[:#]?\s*[A-Z0-9* -]{6,}/gi, "$1 [REDACTED]");
+    .replace(/\b(?:\d[ -]?){13,19}\b/g, "[REDACTED_CARD_OR_ACCOUNT]")
+    .replace(/\b(account|acct|card)\s*(?:number|no|#)?\s*[:#]?\s*[A-Z0-9* -]{6,}/gi, "$1 [REDACTED]");
 }
 
 function classifyFinancialDocument({ ocrText, uploadIntent, sourceType, mimeType }) {
   const text = String(ocrText || "").toLowerCase();
-  const hasReceiptSignals = /(receipt|subtotal|sales tax|tax|tip|gratuity|total due|balance due|items sold|cashier|merchant)/.test(text);
-  const hasStatementSignals = /(statement period|opening balance|closing balance|account number|account summary|deposits|withdrawals)/.test(text);
-  const hasActivitySignals = /(account activity|transaction history|pending|posted|available balance|current balance|deposit|withdrawal|transfer)/.test(text);
-  const hasCardSignals = /(credit card|card activity|minimum payment|payment due|statement balance|available credit|cash back|purchase apr)/.test(text);
+  const hasReceiptSignals = /\b(receipt|subtotal|sales tax|tax|tip|gratuity|total due|balance due|items sold|cashier|merchant)\b/.test(text);
+  const hasStatementSignals = /\b(statement period|opening balance|closing balance|account number|account summary|deposits|withdrawals)\b/.test(text);
+  const hasActivitySignals = /\b(account activity|transaction history|pending|posted|available balance|current balance|deposit|withdrawal|transfer)\b/.test(text);
+  const hasCardSignals = /\b(credit card|card activity|minimum payment|payment due|statement balance|available credit|cash back|purchase apr)\b/.test(text);
   const hasTransactionRows = (text.match(/\$?[-+]?\d{1,3}(?:,\d{3})*\.\d{2}/g) || []).length >= 2;
   if (hasStatementSignals && hasTransactionRows) return { documentType: "bank_statement", confidence: 0.95, reason: "Statement period, balances, or account summary signals were detected with transaction amounts." };
   if (hasCardSignals && hasTransactionRows) return { documentType: "credit_card_activity_screenshot", confidence: 0.92, reason: "Credit-card activity language and transaction amounts were detected." };
@@ -358,6 +358,85 @@ Keep pending and posted transactions separate.
 Do not return a full bank-account number or full credit-card number. Only return last four digits when visibly present.
 Preserve the original visible transaction row in sourceText.
 Return JSON only.`;
+
+function parseBankAmountText(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return null;
+  const isNegative = /^\s*[-(]/.test(raw) || /\)\s*$/.test(raw);
+  const cleaned = raw.replace(/[$,()\s]/g, "").replace(/^\+/, "");
+  const amount = Number(cleaned);
+  if (!Number.isFinite(amount) || Math.abs(amount) < 0.01) return null;
+  return { amount: round2(Math.abs(amount)), isNegative };
+}
+
+function extractBankTransactionsFromOcrText(ocrText, documentType) {
+  const transactions = [];
+  let section = "unknown";
+  const lines = String(ocrText || "")
+    .split(/\r?\n/)
+    .map(line => line.replace(/\|/g, " ").replace(/\s+/g, " ").trim())
+    .filter(Boolean);
+
+  for (const line of lines) {
+    const upper = line.toUpperCase();
+    const startsWithDate = /^\d{1,2}\/\d{1,2}/.test(line);
+    if (!startsWithDate && /PAYMENTS?\s+AND\s+OTHER\s+CREDITS|CREDITS?/.test(upper) && !/PAYMENT\s+DUE/.test(upper)) {
+      section = "credit";
+      continue;
+    }
+    if (!startsWithDate && /PURCHASES?|TRANSACTIONS?|ACCOUNT\s+ACTIVITY|DEBITS?|WITHDRAWALS?/.test(upper)) {
+      section = /ACCOUNT\s+ACTIVITY|TRANSACTIONS?/.test(upper) ? "unknown" : "debit";
+      continue;
+    }
+
+    const match = line.match(/^(\d{1,2}\/\d{1,2}(?:\/\d{2,4})?)\s+(.+?)\s+([-+]?\$?\(?\d{1,3}(?:,\d{3})*\.\d{2}\)?)$/);
+    if (!match) continue;
+
+    const [, transactionDate, rawDescription, rawAmount] = match;
+    const parsedAmount = parseBankAmountText(rawAmount);
+    if (!parsedAmount) continue;
+
+    const description = rawDescription
+      .replace(/^&\s*/, "")
+      .replace(/\s{2,}/g, " ")
+      .trim();
+    if (!description || /merchant name|transaction description|amount/i.test(description)) continue;
+
+    let direction = section;
+    if (parsedAmount.isNegative) direction = "credit";
+    if (direction === "unknown" && documentType === "credit_card_activity_screenshot") {
+      direction = parsedAmount.isNegative ? "credit" : "debit";
+    }
+
+    transactions.push({
+      transactionDate,
+      postedDate: null,
+      description: redactSensitiveText(description),
+      amount: parsedAmount.amount,
+      direction,
+      status: "posted",
+      balanceAfterTransaction: null,
+      sourceText: redactSensitiveText(line),
+      confidence: 0.74,
+    });
+  }
+
+  return transactions;
+}
+
+function mergeBankTransactions(primaryTransactions, fallbackTransactions) {
+  const merged = [...(primaryTransactions || [])];
+  const seen = new Set(merged.map(tx => [tx.transactionDate || "", tx.postedDate || "", tx.description || "", Number(tx.amount || 0).toFixed(2)].join("|")));
+
+  for (const tx of fallbackTransactions || []) {
+    const key = [tx.transactionDate || "", tx.postedDate || "", tx.description || "", Number(tx.amount || 0).toFixed(2)].join("|");
+    if (!seen.has(key)) {
+      merged.push(tx);
+      seen.add(key);
+    }
+  }
+  return merged;
+}
 
 function normalizeBankDocument(doc, classifiedType) {
   const sanitizedLast4 = doc.accountLast4 ? String(doc.accountLast4).replace(/\D/g, "").slice(-4) : null;
@@ -1970,6 +2049,11 @@ app.post("/parse-financial-document", requireAppAuth, async (req, res) => {
 
     const bankRaw = parseAndValidateDocumentAnnotation(ocr.documentAnnotation, BankDocumentSchema);
     const bankDocument = normalizeBankDocument(bankRaw, classification.documentType);
+    const fallbackTransactions = extractBankTransactionsFromOcrText(ocr.ocrText, bankDocument.documentType);
+    if (fallbackTransactions.length > 0 && bankDocument.transactions.length < fallbackTransactions.length) {
+      bankDocument.transactions = mergeBankTransactions(bankDocument.transactions, fallbackTransactions);
+      bankDocument.warnings.push("Some transaction rows were recovered from OCR text because structured extraction was incomplete.");
+    }
     const reconciliation = reconcileBankDocument(bankDocument);
     const warnings = [...(bankDocument.warnings || [])];
     if (bankDocument.partialDocument) warnings.push("This appears to be a partial screenshot. Only the visible transactions were imported.");
