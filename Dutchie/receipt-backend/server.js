@@ -334,29 +334,58 @@ function redactSensitiveText(value) {
 function classifyFinancialDocument({ ocrText, uploadIntent, sourceType, mimeType }) {
   const text = String(ocrText || "").toLowerCase();
   const hasReceiptSignals = /\b(receipt|subtotal|sales tax|tax|tip|gratuity|total due|balance due|items sold|cashier|merchant)\b/.test(text);
-  const hasStatementSignals = /\b(statement period|opening balance|closing balance|account number|account summary|deposits|withdrawals)\b/.test(text);
-  const hasActivitySignals = /\b(account activity|transaction history|pending|posted|available balance|current balance|deposit|withdrawal|transfer)\b/.test(text);
-  const hasCardSignals = /\b(credit card|card activity|minimum payment|payment due|statement balance|available credit|cash back|purchase apr)\b/.test(text);
+  const hasStatementSignals = /\b(statement period|opening balance|closing balance|account number|account summary|statement date|new balance)\b/.test(text);
+  const hasActivitySignals = /\b(account activity|transaction history|pending|posted|available balance|current balance|deposit|withdrawal|transfer|merchant name|transaction description|payments and other credits|purchase)\b/.test(text);
+  const hasCardSignals = /\b(credit card|card activity|minimum payment|payment due|statement balance|available credit|cash back|purchase apr|credit line|cardmember|freedom)\b/.test(text);
   const hasTransactionRows = (text.match(/\$?[-+]?\d{1,3}(?:,\d{3})*\.\d{2}/g) || []).length >= 2;
+  const isPdf = sourceType === "pdf" || mimeType === "application/pdf";
+
+  if (uploadIntent === "scan_statement" && hasCardSignals && hasTransactionRows) {
+    return { documentType: "credit_card_activity_screenshot", confidence: 0.94, reason: "Credit-card statement/activity language and transaction rows were detected." };
+  }
+  if (uploadIntent === "scan_statement" && (hasStatementSignals || isPdf) && hasTransactionRows) {
+    return { documentType: "bank_statement", confidence: 0.93, reason: "Statement-like document and transaction rows were detected." };
+  }
+  if (uploadIntent === "scan_statement" && hasActivitySignals && hasTransactionRows) {
+    return { documentType: "account_activity_screenshot", confidence: 0.9, reason: "Account activity labels and visible transaction rows were detected." };
+  }
   if (hasStatementSignals && hasTransactionRows) return { documentType: "bank_statement", confidence: 0.95, reason: "Statement period, balances, or account summary signals were detected with transaction amounts." };
   if (hasCardSignals && hasTransactionRows) return { documentType: "credit_card_activity_screenshot", confidence: 0.92, reason: "Credit-card activity language and transaction amounts were detected." };
   if (hasActivitySignals && hasTransactionRows) return { documentType: "account_activity_screenshot", confidence: 0.9, reason: "Account activity language and visible transaction rows were detected." };
   if (hasReceiptSignals && uploadIntent !== "scan_statement") return { documentType: "receipt", confidence: 0.86, reason: "Receipt-style totals and purchased-item signals were detected." };
+  if (hasTransactionRows && uploadIntent === "scan_statement") return { documentType: isPdf ? "bank_statement" : "account_activity_screenshot", confidence: 0.72, reason: "Visible transaction-like rows were detected, but document labels are limited." };
   if (hasReceiptSignals && uploadIntent === "scan_statement") return { documentType: "ambiguous", confidence: 0.62, reason: "The upload was intended as a statement, but receipt-style fields were detected." };
-  if (hasTransactionRows && uploadIntent === "scan_statement") return { documentType: sourceType === "pdf" || mimeType === "application/pdf" ? "bank_statement" : "account_activity_screenshot", confidence: 0.72, reason: "Visible transaction-like rows were detected, but document labels are limited." };
   return { documentType: "unsupported", confidence: 0.25, reason: "No supported receipt, statement, or account-activity evidence was detected." };
 }
 
-const BANK_DOCUMENT_PROMPT = `You extract bank statements and banking account activity screenshots.
+const BANK_DOCUMENT_PROMPT = `You extract transaction rows from bank statements, credit-card statements, and banking activity screenshots.
 
-Extract only values visibly supported by the document.
+Product goal:
+- Treat statements like receipt itemization, but each extracted item is a transaction row.
+- For PDFs, inspect all pages and find the pages or sections dedicated to transactions/account activity/purchases/payments.
+- For screenshots, use the visible transaction page only.
+- The document may not show a subtotal, statement total, or balance. That is normal. Do not require one.
+
+Extract only transaction rows visibly supported by the document.
+Ignore non-transaction content such as account messages, ads, summaries, year-to-date fee boxes, payment coupons, instructions, and headers.
 Never invent a transaction, balance, account name, account number, date, status, or statement period.
-Return null when a value is absent or unclear.
-Extract only visible transactions.
-If the screenshot appears cropped or rows appear cut off, set partialDocument = true.
-Keep pending and posted transactions separate.
+Return null when a non-transaction field is absent or unclear.
+If no transaction rows are visible, return an empty transactions array and explain in warnings.
+If a screenshot is cropped or rows appear cut off, set partialDocument = true.
+
+Transaction rules:
+- description is the merchant/payee/transaction description exactly enough for a user to recognize it.
+- amount is the visible transaction amount as a positive number.
+- direction = debit for purchases, withdrawals, fees, charges, card purchases, or money spent.
+- direction = credit for payments, deposits, refunds, credits, rewards, or money received.
+- On credit-card statements, PURCHASE sections are debit/spending even if printed as positive amounts.
+- On credit-card statements, PAYMENTS AND OTHER CREDITS sections are credit even if printed with a minus sign.
+- status = pending only when visibly labeled pending; otherwise posted or unknown.
+- Preserve the original visible transaction row in sourceText.
+
+Privacy:
 Do not return a full bank-account number or full credit-card number. Only return last four digits when visibly present.
-Preserve the original visible transaction row in sourceText.
+
 Return JSON only.`;
 
 function parseBankAmountText(value) {
