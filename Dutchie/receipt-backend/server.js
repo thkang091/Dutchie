@@ -18,9 +18,14 @@ const PORT = Number(process.env.PORT || 3001);
 const APP_BEARER_TOKEN = process.env.APP_BEARER_TOKEN || "";
 const MISTRAL_API_KEY = process.env.MISTRAL_API_KEY || "";
 const TEMP_DIR = path.resolve(process.cwd(), "tmp_receipts");
+const DATA_DIR = path.resolve(process.cwd(), "data");
 const SAVE_TEMP_RECEIPTS = process.env.SAVE_TEMP_RECEIPTS === "true";
 const RECOMMENDED_IMAGE_MAX_BYTES = 2 * 1024 * 1024;
 const MISTRAL_OCR_MODEL = process.env.MISTRAL_OCR_MODEL || "mistral-ocr-latest";
+const ADMIN_BEARER_TOKEN = process.env.ADMIN_BEARER_TOKEN || "";
+const ANALYTICS_EVENTS_FILE = process.env.ANALYTICS_EVENTS_FILE || path.join(DATA_DIR, "analytics_events.jsonl");
+const ANALYTICS_RETENTION_DAYS = Number(process.env.ANALYTICS_RETENTION_DAYS || 90);
+const ANALYTICS_MAX_EVENT_BYTES = Number(process.env.ANALYTICS_MAX_EVENT_BYTES || 16 * 1024);
 const ENABLE_DEBUG_RESPONSE =
   process.env.ENABLE_DEBUG_RESPONSE === "true" &&
   process.env.NODE_ENV !== "production";
@@ -51,14 +56,13 @@ if (!MISTRAL_API_KEY) {
   process.exit(1);
 }
 
-if (SAVE_TEMP_RECEIPTS) {
-  fs.mkdirSync(TEMP_DIR, { recursive: true });
-}
+fs.mkdirSync(DATA_DIR, { recursive: true });
+if (SAVE_TEMP_RECEIPTS) fs.mkdirSync(TEMP_DIR, { recursive: true });
 
 const client = new Mistral({ apiKey: MISTRAL_API_KEY });
 
 console.log("\n" + "=".repeat(80));
-console.log("  PRODUCTION RECEIPT PARSER - MISTRAL OCR + CONTRADICTION RESOLVER");
+console.log("  PRODUCTION RECEIPT PARSER - MISTRAL OCR SINGLE PASS");
 console.log("=".repeat(80));
 console.log(`  Port: ${PORT}`);
 console.log(`  Environment: ${process.env.NODE_ENV || "development"}`);
@@ -331,6 +335,267 @@ function redactSensitiveText(value) {
     .replace(/\b(account|acct|card)\s*(?:number|no|#)?\s*[:#]?\s*[A-Z0-9* -]{6,}/gi, "$1 [REDACTED]");
 }
 
+// ============================================================
+// INTERNAL ANALYTICS - FILE-BACKED, NON-BLOCKING
+// ============================================================
+
+const BLOCKED_ANALYTICS_KEYS = [
+  "imagebase64",
+  "filebase64",
+  "base64",
+  "ocrtext",
+  "rawocr",
+  "rawtext",
+  "receipttext",
+  "statementtext",
+  "transactiondescription",
+  "description",
+  "sourcetext",
+  "apikey",
+  "api_key",
+  "authorization",
+  "bearer",
+  "token",
+  "password",
+  "secret",
+  "mistral",
+  "openai",
+];
+
+const ANALYTICS_FAILURE_REASONS = {
+  receipt: new Set([
+    "blurry_image",
+    "invalid_document",
+    "valid_receipt_incorrectly_rejected",
+    "unsupported_file_type",
+    "pdf_extraction_failed",
+    "ocr_timeout",
+    "ocr_provider_error",
+    "parse_failed",
+    "missing_total",
+    "subtotal_selected_as_grand_total",
+    "reconciliation_failed",
+    "backend_timeout",
+    "unknown_error",
+  ]),
+  statement: new Set([
+    "blurry_statement",
+    "invalid_statement",
+    "valid_statement_incorrectly_rejected",
+    "screenshot_classification_failed",
+    "pdf_extraction_failed",
+    "password_protected_pdf",
+    "transaction_extraction_failed",
+    "parse_failed",
+    "backend_timeout",
+    "unknown_error",
+  ]),
+};
+
+function safeString(value, maxLength = 300) {
+  return redactSensitiveText(value)
+    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [REDACTED]")
+    .replace(/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g, "[REDACTED_EMAIL]")
+    .replace(/\+?\d[\d .()\-]{8,}\d/g, "[REDACTED_PHONE_OR_ACCOUNT]")
+    .slice(0, maxLength);
+}
+
+function isBlockedAnalyticsKey(key) {
+  const normalized = String(key || "").replace(/[^a-zA-Z0-9_]/g, "").toLowerCase();
+  return BLOCKED_ANALYTICS_KEYS.some(blocked => normalized.includes(blocked));
+}
+
+function sanitizeAnalyticsValue(value, depth = 0) {
+  if (depth > 4) return "[MAX_DEPTH]";
+  if (value == null) return value;
+  if (typeof value === "number" || typeof value === "boolean") return value;
+  if (value instanceof Date) return value.toISOString();
+  if (typeof value === "string") return safeString(value);
+  if (Array.isArray(value)) {
+    return value.slice(0, 25).map(item => sanitizeAnalyticsValue(item, depth + 1));
+  }
+  if (typeof value === "object") {
+    const output = {};
+    for (const [key, raw] of Object.entries(value).slice(0, 80)) {
+      if (isBlockedAnalyticsKey(key)) {
+        output[key] = "[REDACTED]";
+      } else {
+        output[key] = sanitizeAnalyticsValue(raw, depth + 1);
+      }
+    }
+    return output;
+  }
+  return String(value);
+}
+
+function sanitizeAnalyticsProperties(properties = {}) {
+  const sanitized = sanitizeAnalyticsValue(properties);
+  const encoded = JSON.stringify(sanitized);
+  if (Buffer.byteLength(encoded, "utf8") <= ANALYTICS_MAX_EVENT_BYTES) return sanitized;
+  return {
+    truncated: true,
+    original_size_bytes: Buffer.byteLength(encoded, "utf8"),
+  };
+}
+
+function normalizeAnalyticsFailureReason(kind, reason) {
+  const normalized = String(reason || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  const allowed = ANALYTICS_FAILURE_REASONS[kind];
+  if (allowed?.has(normalized)) return normalized;
+  if (normalized.includes("timeout")) return "backend_timeout";
+  if (normalized.includes("unsupported")) return "unsupported_file_type";
+  if (normalized.includes("pdf")) return "pdf_extraction_failed";
+  if (normalized.includes("ocr")) return kind === "receipt" ? "ocr_provider_error" : "transaction_extraction_failed";
+  if (normalized.includes("parse") || normalized.includes("schema")) return "parse_failed";
+  if (normalized.includes("statement")) return kind === "statement" ? "invalid_statement" : "invalid_document";
+  return "unknown_error";
+}
+
+function requestIdFrom(req) {
+  const provided =
+    req.headers["x-request-id"] ||
+    req.headers["x-dutchie-request-id"] ||
+    req.body?.request_id ||
+    req.body?.requestId;
+  if (typeof provided === "string" && /^[A-Za-z0-9_.:-]{6,96}$/.test(provided)) {
+    return provided;
+  }
+  return `req_${Date.now().toString(36)}_${crypto.randomBytes(4).toString("hex")}`;
+}
+
+function analyticsContextFromRequest(req, reqId) {
+  return {
+    user_id: req.body?.user_id || req.body?.userId || req.headers["x-user-id"] || null,
+    anonymous_id: req.body?.anonymous_id || req.body?.anonymousId || req.headers["x-anonymous-id"] || null,
+    session_id: req.body?.session_id || req.body?.sessionId || req.headers["x-session-id"] || "unknown",
+    request_id: reqId,
+    platform: req.body?.platform || req.headers["x-platform"] || "ios",
+    app_version: req.body?.app_version || req.body?.appVersion || req.headers["x-app-version"] || null,
+  };
+}
+
+function compactAnalyticsEvent(event) {
+  return {
+    id: event.id || `evt_${Date.now().toString(36)}_${crypto.randomBytes(6).toString("hex")}`,
+    user_id: event.user_id ?? null,
+    anonymous_id: event.anonymous_id ?? null,
+    session_id: event.session_id || "unknown",
+    request_id: event.request_id ?? null,
+    event_name: event.event_name,
+    platform: event.platform || "backend",
+    app_version: event.app_version ?? null,
+    properties: sanitizeAnalyticsProperties(event.properties || {}),
+    created_at: event.created_at || new Date().toISOString(),
+  };
+}
+
+function trackAnalyticsEvent(event) {
+  if (!event?.event_name) return;
+  try {
+    const compacted = compactAnalyticsEvent(event);
+    fs.promises
+      .appendFile(ANALYTICS_EVENTS_FILE, JSON.stringify(compacted) + "\n", "utf8")
+      .catch(error => {
+        console.warn("[analytics] write failed:", error?.message || error);
+      });
+  } catch (error) {
+    console.warn("[analytics] event dropped:", error?.message || error);
+  }
+}
+
+async function readAnalyticsEvents({ limit = 5000, from, to } = {}) {
+  try {
+    const raw = await fs.promises.readFile(ANALYTICS_EVENTS_FILE, "utf8");
+    const fromTime = from ? Date.parse(from) : null;
+    const toTime = to ? Date.parse(to) : null;
+    const rows = raw
+      .split(/\n+/)
+      .filter(Boolean)
+      .map(line => {
+        try { return JSON.parse(line); } catch { return null; }
+      })
+      .filter(Boolean)
+      .filter(event => {
+        const created = Date.parse(event.created_at);
+        if (fromTime && created < fromTime) return false;
+        if (toTime && created > toTime) return false;
+        return true;
+      });
+    return rows.slice(-Math.max(1, Math.min(Number(limit) || 5000, 20000)));
+  } catch (error) {
+    if (error?.code === "ENOENT") return [];
+    throw error;
+  }
+}
+
+async function cleanupAnalyticsEvents() {
+  if (!Number.isFinite(ANALYTICS_RETENTION_DAYS) || ANALYTICS_RETENTION_DAYS <= 0) return;
+  try {
+    const cutoff = Date.now() - ANALYTICS_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+    const events = await readAnalyticsEvents({ limit: 200000 });
+    const retained = events.filter(event => Date.parse(event.created_at) >= cutoff);
+    if (retained.length !== events.length) {
+      await fs.promises.writeFile(
+        ANALYTICS_EVENTS_FILE,
+        retained.map(event => JSON.stringify(event)).join("\n") + (retained.length ? "\n" : ""),
+        "utf8"
+      );
+      console.log(`[analytics] Retention cleanup kept ${retained.length}/${events.length} events`);
+    }
+  } catch (error) {
+    console.warn("[analytics] retention cleanup failed:", error?.message || error);
+  }
+}
+
+function summarizeAnalytics(events) {
+  const counts = {};
+  const users = new Set();
+  const sessions = new Set();
+  const errors = {};
+  const durations = [];
+  for (const event of events) {
+    counts[event.event_name] = (counts[event.event_name] || 0) + 1;
+    if (event.user_id) users.add(event.user_id);
+    if (event.session_id) sessions.add(event.session_id);
+    const reason = event.properties?.failure_reason || event.properties?.error_code;
+    if (reason) errors[reason] = (errors[reason] || 0) + 1;
+    const ms = event.properties?.processing_time_ms ?? event.properties?.total_ms;
+    if (Number.isFinite(ms)) durations.push(ms);
+  }
+  durations.sort((a, b) => a - b);
+  const percentile = p => durations.length ? durations[Math.min(durations.length - 1, Math.floor(durations.length * p))] : 0;
+  return {
+    total_events: events.length,
+    unique_users: users.size,
+    unique_sessions: sessions.size,
+    counts,
+    receipt_success_rate: rate(counts.receipt_parse_completed, counts.receipt_upload_started),
+    statement_success_rate: rate(counts.statement_parse_completed, counts.statement_upload_started),
+    ocr_success_rate: rate(counts.receipt_ocr_completed, (counts.receipt_ocr_started || 0) + (counts.statement_extraction_started || 0)),
+    most_common_errors: Object.entries(errors)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 12)
+      .map(([reason, count]) => ({ reason, count })),
+    response_time_ms: {
+      average: durations.length ? Math.round(durations.reduce((sum, ms) => sum + ms, 0) / durations.length) : 0,
+      p95: percentile(0.95),
+      p99: percentile(0.99),
+    },
+  };
+}
+
+function rate(success = 0, total = 0) {
+  return total > 0 ? Number(((success / total) * 100).toFixed(1)) : 0;
+}
+
+function hashIdentifier(value) {
+  if (!value) return null;
+  return crypto.createHash("sha256").update(String(value)).digest("hex").slice(0, 24);
+}
+
 function classifyFinancialDocument({ ocrText, uploadIntent, sourceType, mimeType }) {
   const text = String(ocrText || "").toLowerCase();
   const hasReceiptSignals = /\b(receipt|subtotal|sales tax|tax|tip|gratuity|total due|balance due|items sold|cashier|merchant)\b/.test(text);
@@ -356,6 +621,72 @@ function classifyFinancialDocument({ ocrText, uploadIntent, sourceType, mimeType
   if (hasTransactionRows && uploadIntent === "scan_statement") return { documentType: isPdf ? "bank_statement" : "account_activity_screenshot", confidence: 0.72, reason: "Visible transaction-like rows were detected, but document labels are limited." };
   if (hasReceiptSignals && uploadIntent === "scan_statement") return { documentType: "ambiguous", confidence: 0.62, reason: "The upload was intended as a statement, but receipt-style fields were detected." };
   return { documentType: "unsupported", confidence: 0.25, reason: "No supported receipt, statement, or account-activity evidence was detected." };
+}
+
+function classifyReceiptUpload({ ocrText, parsed }) {
+  const text = String(ocrText || "").toLowerCase();
+  const words = text.match(/[a-z0-9$.,#-]+/g) || [];
+  const amountCount = (text.match(/\$?[-+]?\d{1,3}(?:,\d{3})*\.\d{2}/g) || []).length;
+  const receiptSignals = [
+    /\breceipt\b/,
+    /\bsubtotal\b/,
+    /\bsales\s+tax\b/,
+    /\btax\b/,
+    /\btip\b/,
+    /\bgratuity\b/,
+    /\btotal\s+(?:due|paid|amount|sale|order)\b/,
+    /\bbalance\s+due\b/,
+    /\bitems?\s+sold\b/,
+    /\bcashier\b/,
+    /\btender\b/,
+    /\bchange\b/,
+    /\border\s*(?:#|number|no\.?|id)\b/,
+    /\binvoice\b/,
+    /\bmerchant\s+copy\b/,
+    /\b(?:visa|mastercard|amex|discover)\b/,
+    /\bauth\s*(?:code|#)\b/,
+  ];
+  const statementSignals = /\b(statement period|opening balance|closing balance|account number|account summary|statement date|new balance|minimum payment|payment due|available credit|transaction history|account activity)\b/.test(text);
+  const receiptSignalCount = receiptSignals.reduce((count, regex) => count + (regex.test(text) ? 1 : 0), 0);
+  const itemCount = Array.isArray(parsed?.items) ? parsed.items.length : 0;
+  const hasVisibleTotal = parsed?.grandTotal != null || parsed?.subtotal != null || /\b(?:grand\s+total|total|amount\s+due|balance\s+due)\b/.test(text);
+
+  if (statementSignals) {
+    return {
+      ok: false,
+      code: "NOT_A_RECEIPT",
+      confidence: 0.2,
+      reason: "Statement or account-activity text was detected, not a receipt.",
+    };
+  }
+
+  if (receiptSignalCount >= 1 && amountCount >= 1 && itemCount >= 1) {
+    return { ok: true, confidence: Math.min(0.98, 0.75 + receiptSignalCount * 0.04), reason: "Receipt text, prices, and purchased items were detected." };
+  }
+
+  if (receiptSignalCount >= 2 && amountCount >= 1 && hasVisibleTotal) {
+    return { ok: true, confidence: 0.84, reason: "Receipt totals and receipt-style labels were detected." };
+  }
+
+  if (itemCount >= 2 && amountCount >= 2 && hasVisibleTotal && receiptSignalCount >= 1) {
+    return { ok: true, confidence: 0.82, reason: "Receipt-like item rows and totals were detected." };
+  }
+
+  if (words.length < 8 || receiptSignalCount === 0) {
+    return {
+      ok: false,
+      code: "NOT_A_RECEIPT",
+      confidence: 0.18,
+      reason: "No reliable receipt text was detected. A photo of food or an object should not be parsed as a receipt.",
+    };
+  }
+
+  return {
+    ok: false,
+    code: "NOT_A_RECEIPT",
+    confidence: 0.45,
+    reason: "The upload did not contain enough receipt evidence to safely parse financial values.",
+  };
 }
 
 const BANK_DOCUMENT_PROMPT = `You extract transaction rows from bank statements, credit-card statements, and banking activity screenshots.
@@ -998,23 +1329,10 @@ function normalizeParsedReceipt(parsed) {
     items: (parsed.items || []).map(item => {
       const originalAmount = toNumber(item.originalAmount);
       const itemDiscount = toNumber(item.itemDiscount);
-      let amount = round2(item.amount);
-
-      if (
-        originalAmount != null &&
-        itemDiscount != null &&
-        itemDiscount > 0 &&
-        originalAmount >= itemDiscount
-      ) {
-        const discountedAmount = round2(originalAmount - itemDiscount);
-        if (amount == null || Math.abs(amount - discountedAmount) > 0.01) {
-          amount = discountedAmount;
-        }
-      }
 
       return {
         name: normalizeItemName(item.name),
-        amount,
+        amount: round2(item.amount),
         originalAmount,
         itemDiscount,
         itemDiscountLabel: item.itemDiscountLabel ?? null,
@@ -1661,7 +1979,7 @@ function determineParseStatus(reconciliation, normalized, hasRefund, resolutionR
   }
 
   // Adjust confidence based on contradiction resolution
-  if (resolutionResult.selectedCandidate !== "original") {
+  if (resolutionResult?.selectedCandidate && resolutionResult.selectedCandidate !== "original") {
     // Applied a repair - slightly lower confidence
     confidence = confidence === "high" ? "medium" : confidence;
   }
@@ -1703,12 +2021,7 @@ function buildApiResponse(parseResult, timings, reqId) {
   const { confidence, status } = determineParseStatus(reconciliation, parsed, hasRefund, resolutionResult);
 
   let route = "mistral_single_pass";
-  let routeReason = "exact_reconciliation";
-
-  if (resolutionResult.selectedCandidate !== "original") {
-    route = "mistral_with_contradiction_repair";
-    routeReason = `applied_${resolutionResult.selectedCandidate}`;
-  }
+  let routeReason = "mistral_structured_receipt_parse";
 
   if (status === "success" && reconciliation.mathCheckPassed) {
     routeReason = reconciliation.mathCheckPassed ? "exact_reconciliation" : routeReason;
@@ -1774,7 +2087,7 @@ function buildApiResponse(parseResult, timings, reqId) {
     routeReason,
     timings,
     debug: ENABLE_DEBUG_RESPONSE ? {
-      parser_version: "production_v2_contradiction_resolver_fixed",
+      parser_version: "production_v3_mistral_single_pass",
       model_used: result?.model || "mistral-ocr-latest",
       ocr_text_length: ocrText.length,
       ocr_text: ocrText,
@@ -1812,16 +2125,18 @@ function buildApiResponse(parseResult, timings, reqId) {
           })),
       },
       contradiction_resolution: {
-        suspicious_items_detected: resolutionResult.suspicious.length,
-        suspicious_items: resolutionResult.suspicious.map(s => ({
+        enabled: false,
+        reason: "disabled_to_preserve_mistral_itemization_and_discount_interpretation",
+        suspicious_items_detected: resolutionResult?.suspicious?.length || 0,
+        suspicious_items: (resolutionResult?.suspicious || []).map(s => ({
           name: s.item.name,
           amount: s.item.amount,
           flags: s.flags,
           suspicion_score: s.suspicionScore,
         })),
-        candidates_tried: resolutionResult.candidatesTried,
-        selected_candidate: resolutionResult.selectedCandidate,
-        changes_applied: resolutionResult.changes,
+        candidates_tried: resolutionResult?.candidatesTried || 0,
+        selected_candidate: resolutionResult?.selectedCandidate || "not_run",
+        changes_applied: resolutionResult?.changes || [],
       },
       arithmetic_breakdown: {
         items_detail: reconciliation.itemBreakdown,
@@ -1846,10 +2161,20 @@ function requireAppAuth(req, res, next) {
   next();
 }
 
+function requireAdminAuth(req, res, next) {
+  const authHeader = req.headers.authorization || "";
+  const token = ADMIN_BEARER_TOKEN || (process.env.NODE_ENV !== "production" ? APP_BEARER_TOKEN : "");
+  if (!token || authHeader !== `Bearer ${token}`) {
+    return res.status(401).json({ ok: false, error: "Admin authorization required" });
+  }
+  next();
+}
+
 app.post("/parse-receipt", requireAppAuth, async (req, res) => {
-  const reqId = `req_${Date.now().toString(36)}`;
+  const reqId = requestIdFrom(req);
   const startedAt = Date.now();
   let tempImagePath = null;
+  const analyticsContext = analyticsContextFromRequest(req, reqId);
   const timings = {
     decode_ms: 0,
     temp_file_write_ms: 0,
@@ -1861,14 +2186,31 @@ app.post("/parse-receipt", requireAppAuth, async (req, res) => {
   };
 
   console.log("\n" + "=".repeat(80));
-  console.log(`[${reqId}] RECEIPT PARSE REQUEST (WITH CONTRADICTION RESOLUTION)`);
+  console.log(`[${reqId}] RECEIPT PARSE REQUEST (MISTRAL SINGLE PASS)`);
   console.log("=".repeat(80));
 
   try {
-    const { imageBase64, mimeType = "image/jpeg" } = req.body || {};
+    const { imageBase64, mimeType = "image/jpeg", sourceType = "unknown", mode = "unknown" } = req.body || {};
+
+    trackAnalyticsEvent({
+      ...analyticsContext,
+      event_name: "receipt_upload_started",
+      properties: {
+        request_id: reqId,
+        upload_source: sourceType,
+        file_type: mimeType,
+        expected_document_type: "receipt",
+        mode,
+      },
+    });
 
     if (!imageBase64) {
       console.log(`[${reqId}] ✗ Missing imageBase64`);
+      trackAnalyticsEvent({
+        ...analyticsContext,
+        event_name: "receipt_upload_rejected",
+        properties: { request_id: reqId, failure_reason: "invalid_document", error_code: "MISSING_IMAGE" },
+      });
       return res.status(400).json({ error: "Missing imageBase64 in request body" });
     }
 
@@ -1882,14 +2224,36 @@ app.post("/parse-receipt", requireAppAuth, async (req, res) => {
     const buffer = Buffer.from(base64Data, "base64");
     const uploadValidation = validateUploadBuffer(buffer, mimeType);
     if (!uploadValidation.ok) {
+      trackAnalyticsEvent({
+        ...analyticsContext,
+        event_name: "receipt_upload_rejected",
+        properties: {
+          request_id: reqId,
+          failure_reason: normalizeAnalyticsFailureReason("receipt", uploadValidation.code),
+          error_code: uploadValidation.code,
+          file_type: mimeType,
+        },
+      });
       return res.status(uploadValidation.status).json({
         error: { code: uploadValidation.code, message: uploadValidation.message },
+        request_id: reqId,
         timings,
       });
     }
     const safeMimeType = uploadValidation.mimeType;
     timings.decode_ms = Date.now() - decodeStart;
     console.log(`[${reqId}] Image size: ${(buffer.length / 1024).toFixed(2)} KB`);
+    trackAnalyticsEvent({
+      ...analyticsContext,
+      event_name: "receipt_upload_validated",
+      properties: {
+        request_id: reqId,
+        upload_source: sourceType,
+        file_type: safeMimeType,
+        image_size_bytes: buffer.length,
+        mode,
+      },
+    });
 
     if (buffer.length > RECOMMENDED_IMAGE_MAX_BYTES) {
       console.log(`[${reqId}] Large image detected. Compress on the client for faster OCR.`);
@@ -1897,6 +2261,11 @@ app.post("/parse-receipt", requireAppAuth, async (req, res) => {
 
     if (buffer.length < 128) {
       console.log(`[${reqId}] ✗ Image too small`);
+      trackAnalyticsEvent({
+        ...analyticsContext,
+        event_name: "receipt_upload_rejected",
+        properties: { request_id: reqId, failure_reason: "invalid_document", error_code: "IMAGE_TOO_SMALL" },
+      });
       return res.status(400).json({ error: "Image too small or corrupt" });
     }
 
@@ -1910,27 +2279,85 @@ app.post("/parse-receipt", requireAppAuth, async (req, res) => {
     }
 
     const ocrStart = Date.now();
+    trackAnalyticsEvent({
+      ...analyticsContext,
+      event_name: "receipt_ocr_started",
+      properties: { request_id: reqId, ocr_provider: "mistral", file_type: safeMimeType, mode },
+    });
     const { parsed, ocrText, result } = await callMistralOCR(buffer, safeMimeType, reqId);
     timings.ocr_ms = Date.now() - ocrStart;
+    trackAnalyticsEvent({
+      ...analyticsContext,
+      event_name: "receipt_ocr_completed",
+      properties: {
+        request_id: reqId,
+        ocr_provider: "mistral",
+        processing_time_ms: timings.ocr_ms,
+        detected_document_type: "receipt_candidate",
+        ocr_text_length: ocrText.length,
+      },
+    });
+
+    const receiptClassification = classifyReceiptUpload({ ocrText, parsed });
+    console.log(`[${reqId}] Receipt classification: ${receiptClassification.ok ? "receipt" : "reject"} confidence=${receiptClassification.confidence} reason=${receiptClassification.reason}`);
+    if (!receiptClassification.ok) {
+      timings.total_ms = Date.now() - startedAt;
+      trackAnalyticsEvent({
+        ...analyticsContext,
+        event_name: "receipt_upload_rejected",
+        properties: {
+          request_id: reqId,
+          failure_reason: "invalid_document",
+          detected_document_type: "not_receipt",
+          classification_confidence: receiptClassification.confidence,
+          processing_time_ms: timings.total_ms,
+          error_code: receiptClassification.code || "NOT_A_RECEIPT",
+        },
+      });
+      return res.status(422).json({
+        ok: false,
+        error: {
+          code: receiptClassification.code || "NOT_A_RECEIPT",
+          message: "This does not look like a receipt. Please scan a receipt image instead.",
+        },
+        request_id: reqId,
+        classification: receiptClassification,
+        timings,
+      });
+    }
     
     let normalized = null;
     let rejected = [];
-    let resolutionResult = null;
+    let resolutionResult = {
+      receipt: null,
+      selectedCandidate: "not_run",
+      candidatesTried: 0,
+      suspicious: [],
+      changes: [],
+      allCandidates: [],
+    };
     
     if (parsed) {
+      trackAnalyticsEvent({
+        ...analyticsContext,
+        event_name: "receipt_parse_started",
+        properties: { request_id: reqId, parser: "mistral_structured_output", mode },
+      });
       const deterministicCleanupStart = Date.now();
       normalized = normalizeParsedReceipt(parsed);
-      const filterResult = filterNonItems(normalized.items, ocrText);
-      normalized.items = filterResult.filtered;
-      rejected = filterResult.rejected;
       timings.deterministic_cleanup_ms = Date.now() - deterministicCleanupStart;
 
-      const contradictionResolutionStart = Date.now();
-      resolutionResult = resolveFinancialContradictions(normalized, reqId);
-      normalized = resolutionResult.receipt;
-      timings.contradiction_resolution_ms = Date.now() - contradictionResolutionStart;
+      resolutionResult = {
+        receipt: normalized,
+        selectedCandidate: "not_run",
+        candidatesTried: 0,
+        suspicious: [],
+        changes: [],
+        allCandidates: [],
+      };
 
       normalized = applyFastLocalNormalization(normalized);
+      resolutionResult.receipt = normalized;
     }
 
     const reconciliationStart = Date.now();
@@ -1950,7 +2377,7 @@ app.post("/parse-receipt", requireAppAuth, async (req, res) => {
 
     // Enhanced logging
     console.log(`[${reqId}] Final Results:`);
-    console.log(`[${reqId}]   - Items: ${normalized?.items.length || 0} (${rejected.length} rejected)`);
+    console.log(`[${reqId}]   - Items: ${normalized?.items.length || 0} (Mistral itemization preserved)`);
     
     if (reconciliation.itemBreakdown && reconciliation.itemBreakdown.length > 0) {
       console.log(`[${reqId}]   - Item Details:`);
@@ -1968,17 +2395,12 @@ app.post("/parse-receipt", requireAppAuth, async (req, res) => {
     console.log(`[${reqId}]   - Math check: ${reconciliation.mathCheckPassed ? "✓ PASS" : "✗ FAIL"}`);
     console.log(`[${reqId}]   - Total gap: $${reconciliation.totalGap?.toFixed(2) ?? "N/A"}`);
 
-    if (rejected.length > 0) {
-      console.log(`[${reqId}]   - Rejected items:`);
-      rejected.forEach(r => console.log(`[${reqId}]     • ${r.item.name} ($${r.item.amount}) - ${r.reason}`));
-    }
-
     console.log(`[${reqId}] Timing breakdown:`);
     console.log(`[${reqId}]   - Decode: ${timings.decode_ms}ms`);
     console.log(`[${reqId}]   - Temp file write: ${timings.temp_file_write_ms}ms`);
     console.log(`[${reqId}]   - OCR: ${timings.ocr_ms}ms`);
-    console.log(`[${reqId}]   - Deterministic cleanup: ${timings.deterministic_cleanup_ms}ms`);
-    console.log(`[${reqId}]   - Contradiction resolution: ${timings.contradiction_resolution_ms}ms`);
+    console.log(`[${reqId}]   - Mistral result shaping: ${timings.deterministic_cleanup_ms}ms`);
+    console.log(`[${reqId}]   - Contradiction resolution: ${timings.contradiction_resolution_ms}ms (disabled)`);
     console.log(`[${reqId}]   - Reconciliation: ${timings.reconciliation_ms}ms`);
     console.log(`[${reqId}]   - Total: ${timings.total_ms}ms`);
 
@@ -1987,6 +2409,25 @@ app.post("/parse-receipt", requireAppAuth, async (req, res) => {
       timings,
       reqId
     );
+    trackAnalyticsEvent({
+      ...analyticsContext,
+      event_name: "receipt_parse_completed",
+      properties: {
+        request_id: reqId,
+        processing_time_ms: timings.total_ms,
+        item_count: normalized?.items.length || 0,
+        subtotal_found: normalized?.subtotal != null,
+        tax_found: normalized?.tax != null,
+        tip_found: normalized?.tip != null,
+        fees_found: normalized?.fees != null,
+        discount_found: normalized?.orderLevelDiscount != null || (normalized?.items || []).some(item => (item.itemDiscount ?? 0) > 0),
+        grand_total_found: normalized?.grandTotal != null,
+        reconciliation_passed: Boolean(reconciliation.mathCheckPassed),
+        correction_count: 0,
+        status: response.status,
+        route: response.route,
+      },
+    });
 
     console.log(`[${reqId}] ✓ Complete in ${timings.total_ms}ms`);
     console.log(`[${reqId}] Status: ${response.status} | Confidence: ${response.confidence}`);
@@ -1998,9 +2439,21 @@ app.post("/parse-receipt", requireAppAuth, async (req, res) => {
   } catch (error) {
     timings.total_ms = Date.now() - startedAt;
     console.error(`[${reqId}] ✗ ERROR:`, error);
+    trackAnalyticsEvent({
+      ...analyticsContext,
+      event_name: error?.message?.toLowerCase().includes("ocr") ? "receipt_ocr_failed" : "receipt_parse_failed",
+      properties: {
+        request_id: reqId,
+        failure_reason: normalizeAnalyticsFailureReason("receipt", error?.code || error?.message),
+        error_code: error?.code || "UNKNOWN_PARSE_ERROR",
+        sanitized_message: safeString(error?.message || "unknown_error"),
+        processing_time_ms: timings.total_ms,
+      },
+    });
     return res.status(500).json({
       error: "Failed to parse receipt",
       detail: error?.message || "unknown_error",
+      request_id: reqId,
       timings,
     });
   } finally {
@@ -2016,28 +2469,268 @@ app.get("/", (req, res) => {
   res.json({ ok: true, service: "financial-document-parser", health: "/health" });
 });
 
+app.post("/analytics/events", requireAppAuth, (req, res) => {
+  const reqId = requestIdFrom(req);
+  const context = analyticsContextFromRequest(req, reqId);
+  const events = Array.isArray(req.body?.events) ? req.body.events : [req.body];
+  let accepted = 0;
+
+  for (const event of events.slice(0, 50)) {
+    if (!event?.event_name && !event?.eventName) continue;
+    trackAnalyticsEvent({
+      ...context,
+      user_id: event.user_id ?? event.userId ?? context.user_id,
+      anonymous_id: event.anonymous_id ?? event.anonymousId ?? context.anonymous_id,
+      session_id: event.session_id ?? event.sessionId ?? context.session_id,
+      request_id: event.request_id ?? event.requestId ?? context.request_id,
+      event_name: event.event_name ?? event.eventName,
+      platform: event.platform ?? context.platform,
+      app_version: event.app_version ?? event.appVersion ?? context.app_version,
+      properties: event.properties || {},
+    });
+    accepted += 1;
+  }
+
+  res.json({ ok: true, accepted, request_id: reqId });
+});
+
+function parseAnalyticsRange(query) {
+  const now = new Date();
+  const preset = query.range || "7d";
+  let from = query.from;
+  let to = query.to;
+  if (!from) {
+    const days =
+      preset === "today" ? 1 :
+      preset === "30d" ? 30 :
+      preset === "all" ? 3650 :
+      7;
+    from = new Date(now.getTime() - days * 24 * 60 * 60 * 1000).toISOString();
+  }
+  if (!to) to = now.toISOString();
+  return { from, to };
+}
+
+function filterAnalyticsEvents(events, query) {
+  const filters = {
+    user_id: query.user_id,
+    anonymous_id: query.anonymous_id,
+    session_id: query.session_id,
+    request_id: query.request_id,
+    app_version: query.app_version,
+    platform: query.platform,
+    event_name: query.event_name,
+  };
+  return events.filter(event => {
+    for (const [key, value] of Object.entries(filters)) {
+      if (value && String(event[key] || "") !== String(value)) return false;
+    }
+    const props = event.properties || {};
+    if (query.mode && props.mode !== query.mode) return false;
+    if (query.document_type && props.detected_document_type !== query.document_type && props.expected_document_type !== query.document_type) return false;
+    if (query.file_type && props.file_type !== query.file_type) return false;
+    if (query.error_category && props.failure_reason !== query.error_category && props.error_code !== query.error_category) return false;
+    if (query.subscription_product && props.product_id !== query.subscription_product) return false;
+    return true;
+  });
+}
+
+app.get("/admin/analytics/summary", requireAdminAuth, async (req, res) => {
+  const range = parseAnalyticsRange(req.query);
+  const events = filterAnalyticsEvents(await readAnalyticsEvents({ ...range, limit: 20000 }), req.query);
+  res.json({ ok: true, range, summary: summarizeAnalytics(events) });
+});
+
+app.get("/admin/analytics/events", requireAdminAuth, async (req, res) => {
+  const range = parseAnalyticsRange(req.query);
+  const limit = Math.min(Number(req.query.limit || 500), 5000);
+  const events = filterAnalyticsEvents(await readAnalyticsEvents({ ...range, limit: 20000 }), req.query).slice(-limit).reverse();
+  res.json({ ok: true, range, events });
+});
+
+app.get("/admin/analytics", requireAdminAuth, async (req, res) => {
+  const range = parseAnalyticsRange(req.query);
+  const events = filterAnalyticsEvents(await readAnalyticsEvents({ ...range, limit: 20000 }), req.query);
+  const summary = summarizeAnalytics(events);
+  const recent = events.slice(-100).reverse();
+  res.type("html").send(renderAnalyticsDashboard({ range, summary, recent }));
+});
+
+function renderAnalyticsDashboard({ range, summary, recent }) {
+  const eventRows = recent.map(event => `
+    <tr>
+      <td>${escapeHtml(event.created_at)}</td>
+      <td>${escapeHtml(event.event_name)}</td>
+      <td>${escapeHtml(event.user_id || "")}</td>
+      <td>${escapeHtml(event.session_id || "")}</td>
+      <td>${escapeHtml(event.request_id || "")}</td>
+      <td>${escapeHtml(event.properties?.failure_reason || event.properties?.error_code || "")}</td>
+      <td><pre>${escapeHtml(JSON.stringify(event.properties || {}, null, 2))}</pre></td>
+    </tr>
+  `).join("");
+
+  const countCards = Object.entries(summary.counts)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 24)
+    .map(([name, count]) => `<div class="card"><strong>${escapeHtml(name)}</strong><span>${count}</span></div>`)
+    .join("");
+
+  const errors = summary.most_common_errors
+    .map(error => `<li>${escapeHtml(error.reason)} <strong>${error.count}</strong></li>`)
+    .join("");
+
+  return `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Dutchie Analytics</title>
+  <style>
+    :root { color-scheme: light; --ink:#1c1a16; --cream:#fffdf7; --line:#ded8ca; --muted:#777168; }
+    body { margin:0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background:var(--cream); color:var(--ink); }
+    header { padding:28px 32px 18px; border-bottom:2px dashed var(--line); }
+    h1 { margin:0; font-size:28px; letter-spacing:.04em; }
+    main { padding:24px 32px 48px; }
+    .grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap:12px; margin:18px 0 28px; }
+    .card { border:1px solid var(--line); background:white; padding:14px; display:flex; justify-content:space-between; gap:12px; }
+    .card strong { font-size:11px; text-transform:uppercase; color:var(--muted); }
+    .card span { font-size:24px; font-weight:800; }
+    .tabs { display:grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap:12px; }
+    section { margin-top:26px; }
+    table { width:100%; border-collapse:collapse; background:white; border:1px solid var(--line); }
+    th, td { padding:10px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; font-size:12px; }
+    th { background:#f3efe5; text-transform:uppercase; letter-spacing:.08em; }
+    pre { white-space:pre-wrap; max-width:420px; margin:0; color:var(--muted); }
+    a { color:var(--ink); }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Dutchie Analytics</h1>
+    <p>Range: ${escapeHtml(range.from)} to ${escapeHtml(range.to)}</p>
+  </header>
+  <main>
+    <div class="grid">
+      <div class="card"><strong>Total events</strong><span>${summary.total_events}</span></div>
+      <div class="card"><strong>Unique users</strong><span>${summary.unique_users}</span></div>
+      <div class="card"><strong>Unique sessions</strong><span>${summary.unique_sessions}</span></div>
+      <div class="card"><strong>Receipt success</strong><span>${summary.receipt_success_rate}%</span></div>
+      <div class="card"><strong>Statement success</strong><span>${summary.statement_success_rate}%</span></div>
+      <div class="card"><strong>OCR success</strong><span>${summary.ocr_success_rate}%</span></div>
+      <div class="card"><strong>Avg ms</strong><span>${summary.response_time_ms.average}</span></div>
+      <div class="card"><strong>P95 ms</strong><span>${summary.response_time_ms.p95}</span></div>
+    </div>
+
+    <section>
+      <h2>Event Counts</h2>
+      <div class="grid">${countCards || "<p>No events yet.</p>"}</div>
+    </section>
+
+    <section>
+      <h2>Most Common Errors</h2>
+      <ul>${errors || "<li>No errors recorded.</li>"}</ul>
+    </section>
+
+    <section>
+      <h2>Recent Events</h2>
+      <table>
+        <thead>
+          <tr><th>Timestamp</th><th>Event</th><th>User</th><th>Session</th><th>Request</th><th>Error</th><th>Properties</th></tr>
+        </thead>
+        <tbody>${eventRows || "<tr><td colspan='7'>No events yet.</td></tr>"}</tbody>
+      </table>
+    </section>
+  </main>
+</body>
+</html>`;
+}
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
 app.post("/parse-financial-document", requireAppAuth, async (req, res) => {
-  const reqId = `req_${Date.now().toString(36)}`;
+  const reqId = requestIdFrom(req);
   const startedAt = Date.now();
   let tempPath = null;
+  const analyticsContext = analyticsContextFromRequest(req, reqId);
 
   console.log("\n" + "=".repeat(80));
   console.log(`[${reqId}] FINANCIAL DOCUMENT PARSE REQUEST`);
   console.log("=".repeat(80));
 
   try {
-    const { fileBase64, imageBase64, mimeType = "image/jpeg", uploadIntent = "scan_statement", sourceType = "screenshot" } = req.body || {};
+    const { fileBase64, imageBase64, mimeType = "image/jpeg", uploadIntent = "scan_statement", sourceType = "screenshot", mode = "statement" } = req.body || {};
+    trackAnalyticsEvent({
+      ...analyticsContext,
+      event_name: "statement_upload_started",
+      properties: {
+        request_id: reqId,
+        upload_source: sourceType,
+        file_type: mimeType,
+        expected_document_type: "bank_statement",
+        mode,
+      },
+    });
     const encoded = fileBase64 || imageBase64;
-    if (!encoded) return res.status(400).json({ ok: false, error: { code: "MISSING_FILE", message: "Missing fileBase64 in request body." } });
+    if (!encoded) {
+      trackAnalyticsEvent({
+        ...analyticsContext,
+        event_name: "statement_upload_rejected",
+        properties: { request_id: reqId, failure_reason: "invalid_statement", error_code: "MISSING_FILE" },
+      });
+      return res.status(400).json({ ok: false, request_id: reqId, error: { code: "MISSING_FILE", message: "Missing fileBase64 in request body." } });
+    }
 
     const buffer = decodeBase64Payload(encoded);
     const uploadValidation = validateUploadBuffer(buffer, mimeType);
-    if (!uploadValidation.ok) return res.status(uploadValidation.status).json({ ok: false, error: { code: uploadValidation.code, message: uploadValidation.message } });
+    if (!uploadValidation.ok) {
+      trackAnalyticsEvent({
+        ...analyticsContext,
+        event_name: "statement_upload_rejected",
+        properties: {
+          request_id: reqId,
+          failure_reason: normalizeAnalyticsFailureReason("statement", uploadValidation.code),
+          error_code: uploadValidation.code,
+          file_type: mimeType,
+        },
+      });
+      return res.status(uploadValidation.status).json({ ok: false, request_id: reqId, error: { code: uploadValidation.code, message: uploadValidation.message } });
+    }
 
     const safeMimeType = uploadValidation.mimeType;
+    trackAnalyticsEvent({
+      ...analyticsContext,
+      event_name: "statement_upload_validated",
+      properties: {
+        request_id: reqId,
+        upload_source: sourceType,
+        file_type: safeMimeType,
+        file_size_bytes: buffer.length,
+        mode,
+      },
+    });
     const hash = fileHash(buffer);
     const cached = getCachedParse(hash, "financial_document");
-    if (cached) return res.json(cached);
+    if (cached) {
+      trackAnalyticsEvent({
+        ...analyticsContext,
+        event_name: "statement_parse_completed",
+        properties: {
+          request_id: reqId,
+          cache_hit: true,
+          detected_document_type: cached.documentType,
+          transaction_count: cached.data?.transactions?.length || 0,
+          processing_time_ms: Date.now() - startedAt,
+        },
+      });
+      return res.json({ ...cached, request_id: cached.request_id || reqId });
+    }
 
     if (SAVE_TEMP_RECEIPTS) {
       const filename = `financial_${Date.now()}_${Math.random().toString(36).slice(2)}${getTempExtension(safeMimeType)}`;
@@ -2045,6 +2738,11 @@ app.post("/parse-financial-document", requireAppAuth, async (req, res) => {
       await fs.promises.writeFile(tempPath, buffer);
     }
 
+    trackAnalyticsEvent({
+      ...analyticsContext,
+      event_name: "statement_extraction_started",
+      properties: { request_id: reqId, ocr_provider: "mistral", file_type: safeMimeType, mode },
+    });
     const ocr = await runMistralOcr({
       buffer,
       mimeType: safeMimeType,
@@ -2054,8 +2752,29 @@ app.post("/parse-financial-document", requireAppAuth, async (req, res) => {
     });
 
     if (safeMimeType === "application/pdf" && ocr.pageCount > MAX_PDF_PAGES) {
-      return res.status(413).json({ ok: false, error: { code: "PDF_PAGE_LIMIT_EXCEEDED", message: `This PDF has ${ocr.pageCount} pages. The current limit is ${MAX_PDF_PAGES} pages.` } });
+      trackAnalyticsEvent({
+        ...analyticsContext,
+        event_name: "statement_upload_rejected",
+        properties: {
+          request_id: reqId,
+          failure_reason: "pdf_extraction_failed",
+          error_code: "PDF_PAGE_LIMIT_EXCEEDED",
+          page_count: ocr.pageCount,
+        },
+      });
+      return res.status(413).json({ ok: false, request_id: reqId, error: { code: "PDF_PAGE_LIMIT_EXCEEDED", message: `This PDF has ${ocr.pageCount} pages. The current limit is ${MAX_PDF_PAGES} pages.` } });
     }
+    trackAnalyticsEvent({
+      ...analyticsContext,
+      event_name: "statement_extraction_completed",
+      properties: {
+        request_id: reqId,
+        ocr_provider: "mistral",
+        processing_time_ms: Date.now() - startedAt,
+        page_count: ocr.pageCount,
+        low_confidence_field_count: ocr.lowConfidenceFields?.length || 0,
+      },
+    });
 
     const classification = classifyFinancialDocument({ ocrText: ocr.ocrText, uploadIntent, sourceType, mimeType: safeMimeType });
     const baseResponse = {
@@ -2068,16 +2787,64 @@ app.post("/parse-financial-document", requireAppAuth, async (req, res) => {
       warnings: [],
       reviewRequired: false,
       ocr: { model: ocr.model, pageCount: ocr.pageCount, lowConfidenceFields: ocr.lowConfidenceFields },
+      request_id: reqId,
     };
 
-    if (["unsupported", "ambiguous"].includes(classification.documentType)) {
-      const response = { ...baseResponse, reviewRequired: true, warnings: [classification.reason] };
+    if (["unsupported", "ambiguous", "receipt"].includes(classification.documentType)) {
+      const response = {
+        ...baseResponse,
+        ok: false,
+        error: {
+          code: "NOT_A_STATEMENT",
+          message: "This does not look like a statement or transaction-history screenshot. Please upload a bank/credit-card statement, PDF, or transaction screenshot.",
+        },
+        reviewRequired: true,
+        warnings: [classification.reason],
+      };
       setCachedParse(hash, "financial_document", response);
-      return res.json(response);
+      trackAnalyticsEvent({
+        ...analyticsContext,
+        event_name: "statement_upload_rejected",
+        properties: {
+          request_id: reqId,
+          failure_reason: classification.documentType === "receipt" ? "invalid_statement" : "screenshot_classification_failed",
+          detected_document_type: classification.documentType,
+          classification_confidence: classification.confidence,
+          error_code: "NOT_A_STATEMENT",
+          processing_time_ms: Date.now() - startedAt,
+        },
+      });
+      return res.status(422).json(response);
     }
 
-    const bankRaw = parseAndValidateDocumentAnnotation(ocr.documentAnnotation, BankDocumentSchema);
-    const bankDocument = normalizeBankDocument(bankRaw, classification.documentType);
+    let bankDocument;
+    let bankRaw;
+    try {
+      trackAnalyticsEvent({
+        ...analyticsContext,
+        event_name: "statement_parse_started",
+        properties: { request_id: reqId, parser: "mistral_structured_output", detected_document_type: classification.documentType },
+      });
+      bankRaw = parseAndValidateDocumentAnnotation(ocr.documentAnnotation, BankDocumentSchema);
+      bankDocument = normalizeBankDocument(bankRaw, classification.documentType);
+    } catch (annotationError) {
+      const fallbackOnlyTransactions = extractBankTransactionsFromOcrText(ocr.ocrText, classification.documentType);
+      if (fallbackOnlyTransactions.length === 0) {
+        throw annotationError;
+      }
+      bankDocument = normalizeBankDocument({
+        documentType: classification.documentType,
+        institutionName: null,
+        accountName: null,
+        accountLast4: null,
+        statementPeriod: { startDate: null, endDate: null },
+        currency: "USD",
+        partialDocument: sourceType !== "pdf",
+        transactions: fallbackOnlyTransactions,
+        warnings: ["Structured extraction was incomplete, so transaction rows were recovered from OCR text."],
+      }, classification.documentType);
+    }
+
     const fallbackTransactions = extractBankTransactionsFromOcrText(ocr.ocrText, bankDocument.documentType);
     if (fallbackTransactions.length > 0 && bankDocument.transactions.length < fallbackTransactions.length) {
       bankDocument.transactions = mergeBankTransactions(bankDocument.transactions, fallbackTransactions);
@@ -2086,7 +2853,35 @@ app.post("/parse-financial-document", requireAppAuth, async (req, res) => {
     const reconciliation = reconcileBankDocument(bankDocument);
     const warnings = [...(bankDocument.warnings || [])];
     if (bankDocument.partialDocument) warnings.push("This appears to be a partial screenshot. Only the visible transactions were imported.");
-    if (bankDocument.transactions.length === 0) warnings.push("No visible transactions were detected.");
+    if (bankDocument.transactions.length === 0) {
+      warnings.push("No visible transactions were detected.");
+      const response = {
+        ...baseResponse,
+        ok: false,
+        error: {
+          code: "NO_STATEMENT_TRANSACTIONS",
+          message: "No statement transactions were detected. Please upload a clearer statement or transaction-history screenshot.",
+        },
+        documentType: bankDocument.documentType,
+        data: bankDocument,
+        reconciliation,
+        warnings,
+        reviewRequired: true,
+      };
+      setCachedParse(hash, "financial_document", response);
+      trackAnalyticsEvent({
+        ...analyticsContext,
+        event_name: "statement_parse_failed",
+        properties: {
+          request_id: reqId,
+          failure_reason: "transaction_extraction_failed",
+          detected_document_type: bankDocument.documentType,
+          error_code: "NO_STATEMENT_TRANSACTIONS",
+          processing_time_ms: Date.now() - startedAt,
+        },
+      });
+      return res.status(422).json(response);
+    }
 
     const response = {
       ...baseResponse,
@@ -2097,12 +2892,36 @@ app.post("/parse-financial-document", requireAppAuth, async (req, res) => {
       reviewRequired: bankDocument.transactions.length === 0 || classification.confidence < 0.75,
     };
     setCachedParse(hash, "financial_document", response);
+    trackAnalyticsEvent({
+      ...analyticsContext,
+      event_name: "statement_parse_completed",
+      properties: {
+        request_id: reqId,
+        detected_document_type: bankDocument.documentType,
+        transaction_count: bankDocument.transactions.length,
+        processing_time_ms: Date.now() - startedAt,
+        reconciliation_status: reconciliation.status,
+        file_type: safeMimeType,
+        mode,
+      },
+    });
     console.log(`[${reqId}] ✓ Financial document parse complete in ${Date.now() - startedAt}ms type=${response.documentType}`);
     return res.json(response);
   } catch (error) {
     const code = error?.code || (error?.message?.toLowerCase().includes("timeout") ? "MISTRAL_TIMEOUT" : "UNKNOWN_PARSE_ERROR");
     console.error(`[${reqId}] ✗ FINANCIAL DOCUMENT ERROR:`, code, error?.message);
-    return res.status(code === "MALFORMED_ANNOTATION" || code === "SCHEMA_VALIDATION_FAILED" ? 422 : 500).json({ ok: false, error: { code, message: error?.message || "Failed to parse financial document." } });
+    trackAnalyticsEvent({
+      ...analyticsContext,
+      event_name: code === "MISTRAL_TIMEOUT" ? "statement_extraction_failed" : "statement_parse_failed",
+      properties: {
+        request_id: reqId,
+        failure_reason: normalizeAnalyticsFailureReason("statement", code || error?.message),
+        error_code: code,
+        sanitized_message: safeString(error?.message || "Failed to parse financial document."),
+        processing_time_ms: Date.now() - startedAt,
+      },
+    });
+    return res.status(code === "MALFORMED_ANNOTATION" || code === "SCHEMA_VALIDATION_FAILED" ? 422 : 500).json({ ok: false, request_id: reqId, error: { code, message: error?.message || "Failed to parse financial document." } });
   } finally {
     if (SAVE_TEMP_RECEIPTS && tempPath) {
       try { await fs.promises.unlink(tempPath); } catch {}
@@ -2186,8 +3005,13 @@ app.get("/health", (req, res) => {
   res.json({
     ok: true,
     timestamp: new Date().toISOString(),
-    version: "2.0.1",
-    parser: "production_mistral_contradiction_resolver_fixed",
+    version: "2.1.0",
+    parser: "production_mistral_single_pass_receipt_parser",
+    analytics: {
+      storage: "jsonl_file",
+      retentionDays: ANALYTICS_RETENTION_DAYS,
+      adminEnabled: Boolean(ADMIN_BEARER_TOKEN) || process.env.NODE_ENV !== "production",
+    },
   });
 });
 
@@ -2195,9 +3019,25 @@ app.get("/health", (req, res) => {
 // SERVER STARTUP
 // ============================================================
 
-app.listen(PORT, "0.0.0.0", () => {
-  console.log("✓ Server ready on http://0.0.0.0:" + PORT);
-  console.log("  Endpoint: POST /parse-receipt (with contradiction resolution)");
-  console.log("  Endpoint: POST /normalize-item-names (optional item-name enrichment)");
-  console.log("  Health: GET /health\n");
-});
+cleanupAnalyticsEvents();
+
+if (process.env.NODE_ENV !== "test") {
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log("✓ Server ready on http://0.0.0.0:" + PORT);
+    console.log("  Endpoint: POST /parse-receipt (Mistral single-pass receipt parsing)");
+    console.log("  Endpoint: POST /parse-financial-document (statements and transaction screenshots)");
+    console.log("  Endpoint: POST /normalize-item-names (optional item-name enrichment)");
+    console.log("  Endpoint: POST /analytics/events (client analytics ingestion)");
+    console.log("  Admin: GET /admin/analytics");
+    console.log("  Health: GET /health\n");
+  });
+}
+
+export {
+  app,
+  hashIdentifier,
+  normalizeAnalyticsFailureReason,
+  sanitizeAnalyticsProperties,
+  safeString,
+  summarizeAnalytics,
+};
